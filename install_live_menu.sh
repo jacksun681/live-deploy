@@ -7,6 +7,7 @@ SCRIPT_NAME="live_menu.sh"
 REAL_PATH="/usr/local/bin/${APP_NAME}.real"
 WRAPPER_PATH="/usr/local/bin/${APP_NAME}"
 BACKUP_DIR="/usr/local/lib/${APP_NAME}"
+LOCAL_INSTALLER="/root/install_live_menu.sh"
 
 URLS=(
   "https://raw.githubusercontent.com/jacksun681/live-deploy/main/${SCRIPT_NAME}"
@@ -20,6 +21,11 @@ need_cmd() {
   }
 }
 
+normalize_file() {
+  local f="$1"
+  sed -i 's/\r$//' "$f" 2>/dev/null || true
+}
+
 download_main() {
   local url tmp
   tmp="$(mktemp)"
@@ -27,15 +33,23 @@ download_main() {
 
   for url in "${URLS[@]}"; do
     echo "[尝试下载] $url"
+
     if ! curl -fsSL --max-time 15 "$url" -o "$tmp" 2>/dev/null; then
       echo "[失败] 下载失败"
       continue
     fi
 
+    normalize_file "$tmp"
+
     grep -q '^#!/usr/bin/env bash' "$tmp" || {
       echo "[跳过] 不是 bash 脚本"
       continue
     }
+
+    if grep -qi '<!DOCTYPE html>\|<html' "$tmp"; then
+      echo "[跳过] 返回的是 HTML 页面"
+      continue
+    fi
 
     if ! bash -n "$tmp" 2>/dev/null; then
       echo "[跳过] 语法检查失败"
@@ -49,6 +63,8 @@ download_main() {
     fi
 
     install -m 755 "$tmp" "$REAL_PATH"
+    normalize_file "$REAL_PATH"
+
     echo "[成功] 已安装到 $REAL_PATH"
     return 0
   done
@@ -92,6 +108,7 @@ esac
 EOF
 
   chmod +x "$WRAPPER_PATH"
+  normalize_file "$WRAPPER_PATH"
 }
 
 rollback_main() {
@@ -100,6 +117,10 @@ rollback_main() {
   cp "$last" "$REAL_PATH"
   chmod +x "$REAL_PATH"
   echo "[回滚完成]"
+}
+
+show_path() {
+  echo "$REAL_PATH"
 }
 
 show_help() {
@@ -117,21 +138,32 @@ show_help() {
 EOF
 }
 
-need_cmd curl curl
+self_fix() {
+  if [[ -f "$LOCAL_INSTALLER" ]]; then
+    normalize_file "$LOCAL_INSTALLER"
+  fi
+}
 
-case "${1:-help}" in
-  install)
-    download_main
-    create_wrapper
-    echo "[完成] 现在可直接运行: live_menu"
-    ;;
-  rollback)
-    rollback_main
-    ;;
-  path)
-    echo "$REAL_PATH"
-    ;;
-  *)
-    show_help
-    ;;
-esac
+main() {
+  self_fix
+  need_cmd curl curl
+
+  case "${1:-help}" in
+    install)
+      download_main
+      create_wrapper
+      echo "[完成] 现在可直接运行: live_menu"
+      ;;
+    rollback)
+      rollback_main
+      ;;
+    path)
+      show_path
+      ;;
+    *)
+      show_help
+      ;;
+  esac
+}
+
+main "${1:-help}"
