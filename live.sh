@@ -3,27 +3,36 @@ set -e
 
 [ "$(id -u)" != 0 ] && echo "请用 root 运行" && exit 1
 
+# 安装依赖
 for i in "curl curl" "qrencode qrencode" "bc bc" "ping iputils-ping" "ip iproute2"; do
   c=${i% *}; p=${i#* }
   command -v "$c" >/dev/null 2>&1 || { apt update -y && apt install -y "$p"; }
 done
 
+# 安装 xray
 command -v xray >/dev/null 2>&1 || bash <(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh) install
 
+# 测试 TCP
 test_tcp() {
   sysctl -w net.ipv4.tcp_congestion_control="$1" >/dev/null 2>&1 || true
   sleep 2
-  ping -c 10 -W 2 8.8.8.8 2>/dev/null | awk -F'/' '/rtt|round-trip/ {print $5 "|" $7}'
+  ping -c 8 -W 2 8.8.8.8 2>/dev/null | awk -F'/' '/rtt|round-trip/ {print $5 "|" $7}'
 }
 
 USE="cubic"
 AVAIL="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+
 if echo "$AVAIL" | grep -qw bbr; then
-  B="$(test_tcp bbr)"; C="$(test_tcp cubic)"
-  BJ="${B#*|}"; CJ="${C#*|}"
+  B="$(test_tcp bbr)"
+  C="$(test_tcp cubic)"
+  BJ="${B#*|}"
+  CJ="${C#*|}"
   (( $(echo "$BJ <= $CJ" | bc -l) )) && USE="bbr"
 fi
 
+echo "使用TCP算法: $USE"
+
+# 写入优化
 cat >/etc/sysctl.d/99-live.conf <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=$USE
@@ -50,6 +59,7 @@ sysctl --system >/dev/null
 IFACE="$(ip route | awk '/default/ {print $5; exit}')"
 [ -n "$IFACE" ] && tc qdisc replace dev "$IFACE" root fq >/dev/null 2>&1 || true
 
+# 生成节点
 read -rp "节点备注名（默认 Live）: " NAME
 NAME="${NAME:-Live}"
 
@@ -63,6 +73,7 @@ IP="$(curl -4 -s https://api.ipify.org || true)"
 [ -z "$IP" ] && read -rp "请输入公网 IP: " IP
 
 mkdir -p /usr/local/etc/xray
+
 cat >/usr/local/etc/xray/config.json <<EOF
 {
   "inbounds":[
@@ -93,7 +104,12 @@ ENC_NAME="$(printf '%s' "$NAME" | sed 's/ /%20/g')"
 LINK="vless://${UUID}@${IP}:443?encryption=none&security=reality&sni=www.cloudflare.com&fp=chrome&pbk=${PUB}&type=tcp&headerType=none#${ENC_NAME}"
 
 echo
-echo "完成，当前算法: $USE"
+echo "=============================="
+echo "完成"
+echo "TCP算法: $USE"
+echo "IP: $IP"
+echo "=============================="
 echo "$LINK"
 echo
-qrencode -t ANSIUTF8 "$LINK"
+
+command -v qrencode >/dev/null && qrencode -t ANSIUTF8 "$LINK"
