@@ -20,6 +20,7 @@ install_deps() {
   need_cmd bc bc
   need_cmd ping iputils-ping
   need_cmd ip iproute2
+  need_cmd python3 python3
 }
 
 install_xray() {
@@ -27,253 +28,154 @@ install_xray() {
     bash <(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh) install
 }
 
-get_public_ip() {
-  local ip
-  ip="$(curl -4 -s https://api.ipify.org || true)"
-  [[ -z "$ip" ]] && ip="$(curl -4 -s https://ifconfig.me || true)"
-  [[ -z "$ip" ]] && ip="$(curl -4 -s https://ip.sb || true)"
-  [[ -z "$ip" ]] && read -rp "请输入公网 IP: " ip
-  echo "$ip"
-}
-
-test_tcp_jitter() {
-  sysctl -w net.ipv4.tcp_congestion_control="$1" >/dev/null 2>&1 || true
-  sleep 2
-  ping -c 6 -W 2 8.8.8.8 2>/dev/null | awk -F'/' '/rtt|round-trip/ {print $7}'
-}
-
-choose_tcp_algo() {
-  local available bbr_jitter cubic_jitter
-  available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-  if ! echo "$available" | grep -qw bbr; then
-    echo "cubic"
-    return
-  fi
-
-  bbr_jitter="$(test_tcp_jitter bbr)"
-  cubic_jitter="$(test_tcp_jitter cubic)"
-
-  if (( $(echo "$bbr_jitter <= $cubic_jitter" | bc -l) )); then
-    echo "bbr"
-  else
-    echo "cubic"
-  fi
-}
-
-write_sysctl() {
-  local algo="$1"
-  cat >"$SYSCTL_CONF" <<EOF
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=$algo
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_mtu_probing=1
-net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_sack=1
-net.ipv4.tcp_window_scaling=1
-net.ipv4.tcp_no_metrics_save=1
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-net.ipv4.tcp_rmem=4096 87380 67108864
-net.ipv4.tcp_wmem=4096 65536 67108864
-net.core.netdev_max_backlog=250000
-net.ipv4.tcp_max_syn_backlog=8192
-net.ipv4.tcp_fin_timeout=15
-net.ipv4.tcp_tw_reuse=1
-net.ipv6.conf.all.disable_ipv6=1
-net.ipv6.conf.default.disable_ipv6=1
-EOF
-
-  sysctl --system >/dev/null
-
-  local iface
-  iface="$(ip route | awk '/default/ {print $5; exit}')"
-  [[ -n "$iface" ]] && tc qdisc replace dev "$iface" root fq >/dev/null 2>&1 || true
-}
-
-new_uuid() {
-  cat /proc/sys/kernel/random/uuid
+get_ip() {
+  curl -4 -s https://api.ipify.org || curl -4 -s https://ifconfig.me || curl -4 -s https://ip.sb
 }
 
 make_keys() {
-  local raw pri pub
   raw="$(xray x25519 2>/dev/null || true)"
-  pri="$(echo "$raw" | awk -F': ' '/Private key|PrivateKey/ {print $2}' | head -n1 | tr -d '\r')"
-  [[ -z "$pri" ]] && { echo "生成 privateKey 失败"; return 1; }
-
-  pub="$(xray x25519 -i "$pri" 2>/dev/null | awk -F': ' '/Public key|PublicKey|Password/ {print $2}' | head -n1 | tr -d '\r')"
-  [[ -z "$pub" ]] && { echo "推导 publicKey/pbk 失败"; return 1; }
-
+  pri="$(echo "$raw" | awk -F': ' '/Private key|PrivateKey/ {print $2}' | head -n1)"
+  pub="$(xray x25519 -i "$pri" 2>/dev/null | awk -F': ' '/Public key|PublicKey|Password/ {print $2}' | head -n1)"
   echo "$pri|$pub"
 }
 
 cfg_get() {
-  grep -oP "$1" "$CONF" 2>/dev/null | head -n1 || true
+  grep -oP "$1" "$CONF" 2>/dev/null | head -n1
 }
 
 write_config() {
-  local uuid="$1" pri="$2" port="$3"
   mkdir -p /usr/local/etc/xray
-
   cat >"$CONF" <<EOF
 {
-  "log": {"loglevel": "warning"},
-  "inbounds": [
-    {
-      "port": $port,
-      "protocol": "vless",
-      "settings": {
-        "clients": [{"id": "$uuid"}],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "$DOMAIN:443",
-          "xver": 0,
-          "serverNames": ["$DOMAIN"],
-          "privateKey": "$pri",
-          "shortIds": [""]
-        }
+  "inbounds":[{
+    "port":$3,
+    "protocol":"vless",
+    "settings":{"clients":[{"id":"$1"}],"decryption":"none"},
+    "streamSettings":{
+      "network":"tcp",
+      "security":"reality",
+      "realitySettings":{
+        "dest":"$DOMAIN:443",
+        "serverNames":["$DOMAIN"],
+        "privateKey":"$2",
+        "shortIds":[""]
       }
     }
-  ],
-  "outbounds": [
-    {"protocol": "freedom"}
-  ]
+  }],
+  "outbounds":[{"protocol":"freedom"}]
 }
 EOF
-
-  systemctl enable xray >/dev/null 2>&1 || true
   systemctl restart xray
 }
 
 build_link() {
-  local uuid="$1" port="$2" pri="$3"
-  local pub ip
-
-  pub="$(xray x25519 -i "$pri" 2>/dev/null | awk -F': ' '/Public key|PublicKey|Password/ {print $2}' | head -n1 | tr -d '\r')"
-  ip="$(get_public_ip)"
-
-  echo "vless://${uuid}@${ip}:${port}?encryption=none&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${pub}&type=tcp&headerType=none#Live"
+  uuid="$1"; port="$2"; pri="$3"
+  pub="$(xray x25519 -i "$pri" 2>/dev/null | awk -F': ' '/Public key|Password/ {print $2}' | head -n1)"
+  ip="$(get_ip)"
+  echo "vless://${uuid}@${ip}:${port}?encryption=none&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${pub}&type=tcp#Live"
 }
 
-show_qr() {
-  command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 "$1"
+copy_link() {
+  link="$1"
+  echo "$link"
+
+  if command -v pbcopy >/dev/null; then echo "$link" | pbcopy && echo "✔ 已复制"
+  elif command -v xclip >/dev/null; then echo "$link" | xclip -selection clipboard && echo "✔ 已复制"
+  elif command -v clip >/dev/null; then echo "$link" | clip && echo "✔ 已复制"
+  fi
+}
+
+start_api() {
+cat > /root/link_api.py <<EOF
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import subprocess
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/link":
+            self.send_response(404); self.end_headers(); return
+        out = subprocess.getoutput("bash /root/get_link.sh")
+        self.send_response(200)
+        self.send_header("Content-type","text/plain")
+        self.end_headers()
+        self.wfile.write(out.encode())
+HTTPServer(("0.0.0.0",8080),H).serve_forever()
+EOF
+
+nohup python3 /root/link_api.py >/dev/null 2>&1 &
+echo "✔ 接口已启动：http://$(get_ip):8080/link"
+}
+
+create_get_link() {
+cat > /root/get_link.sh <<EOF
+#!/usr/bin/env bash
+UUID=\$(grep -oP '"id"\s*:\s*"\K[^"]+' $CONF)
+PRI=\$(grep -oP '"privateKey"\s*:\s*"\K[^"]+' $CONF)
+PORT=\$(grep -oP '"port"\s*:\s*\K\d+' $CONF)
+PBK=\$(xray x25519 -i "\$PRI" 2>/dev/null | awk -F': ' '/Public key|Password/ {print \$2}' | head -n1)
+IP=\$(curl -4 -s https://api.ipify.org)
+echo "vless://\$UUID@\${IP}:\${PORT}?encryption=none&security=reality&sni=$DOMAIN&fp=chrome&pbk=\${PBK}&type=tcp#Live"
+EOF
+chmod +x /root/get_link.sh
 }
 
 install_init() {
   install_deps
   install_xray
 
-  local algo keys pri pub uuid port link
-  algo="$(choose_tcp_algo)"
-  echo "自动选择 TCP 算法: $algo"
-  write_sysctl "$algo"
-
   keys="$(make_keys)"
-  pri="${keys%%|*}"
-  pub="${keys##*|}"
-  uuid="$(new_uuid)"
-  port="443"
+  pri="${keys%%|*}"; pub="${keys##*|}"
+  uuid="$(cat /proc/sys/kernel/random/uuid)"
+  port=443
 
   write_config "$uuid" "$pri" "$port"
-  link="$(build_link "$uuid" "$port" "$pri")"
+  create_get_link
+  start_api
 
-  echo
+  link="$(build_link "$uuid" "$port" "$pri)"
   echo "安装完成"
-  echo "UUID: $uuid"
-  echo "PBK: $pub"
-  echo "端口: $port"
-  echo
-  echo "$link"
-  echo
-  show_qr "$link"
+  copy_link "$link"
 }
 
 show_link() {
-  local uuid pri port link
-
   uuid="$(cfg_get '"id"\s*:\s*"\K[^"]+')"
   pri="$(cfg_get '"privateKey"\s*:\s*"\K[^"]+')"
   port="$(cfg_get '"port"\s*:\s*\K\d+')"
-
-  [[ -z "$uuid" ]] && { echo "未找到配置，请先安装"; return; }
-  [[ -z "$pri" ]] && { echo "未找到 privateKey"; return; }
-  [[ -z "$port" ]] && port=443
-
   link="$(build_link "$uuid" "$port" "$pri")"
-
-  echo
-  echo "$link"
-  echo
-  show_qr "$link"
+  copy_link "$link"
 }
 
 reset_node() {
-  install_deps
-  install_xray
-
-  local keys pri pub uuid port link
   keys="$(make_keys)"
   pri="${keys%%|*}"
-  pub="${keys##*|}"
-  uuid="$(new_uuid)"
+  uuid="$(cat /proc/sys/kernel/random/uuid)"
   port="$(cfg_get '"port"\s*:\s*\K\d+')"
-  [[ -z "$port" ]] && port=443
-
   write_config "$uuid" "$pri" "$port"
   link="$(build_link "$uuid" "$port" "$pri")"
-
-  echo
-  echo "已重置节点，旧链接失效"
-  echo "UUID: $uuid"
-  echo "PBK: $pub"
-  echo
-  echo "$link"
-  echo
-  show_qr "$link"
+  echo "已重置"
+  copy_link "$link"
 }
 
 menu() {
-  clear
-  cat <<EOF
-==============================
-   Xray Reality 菜单管理
-==============================
-1. 查看当前节点链接
-2. 重置节点（旧链接失效）
-3. 修改端口
-4. 重启 Xray
-5. 查看运行状态
-6. 卸载
-0. 退出
-==============================
-EOF
-
-  read -rp "请选择: " choice
-  case "$choice" in
-    1) show_link ;;
-    2) reset_node ;;
-    3) echo "暂未实现" ;;
-    4) systemctl restart xray ;;
-    5) systemctl status xray --no-pager -l ;;
-    6) echo "请手动卸载" ;;
-    0) exit 0 ;;
-    *) echo "无效选项" ;;
-  esac
+clear
+echo "1. 查看链接"
+echo "2. 重置节点"
+echo "3. 启动接口"
+echo "0. 退出"
+read -p "选择: " n
+case $n in
+1) show_link ;;
+2) reset_node ;;
+3) start_api ;;
+0) exit ;;
+esac
 }
 
-# 首次运行
 if [[ ! -f "$CONF" ]]; then
   install_init
-  exit 0
+  exit
 fi
 
-# 后续运行
 while true; do
-  menu
-  echo
-  read -rp "按回车返回菜单..." _
+menu
+read -p "回车继续"
 done
