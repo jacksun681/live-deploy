@@ -5,8 +5,8 @@ CONF="/usr/local/etc/xray/config.json"
 ETC_CONF="/etc/xray/config.json"
 SYSCTL_CONF="/etc/sysctl.d/99-live.conf"
 DOMAIN="www.cloudflare.com"
-DEFAULT_PORT="443"
-DEFAULT_FLOW="xtls-rprx-vision"
+PORT="443"
+FLOW="xtls-rprx-vision"
 
 [[ "$(id -u)" -ne 0 ]] && echo "请用 root 运行" && exit 1
 
@@ -19,16 +19,41 @@ need_cmd() {
 
 install_deps() {
   need_cmd curl curl
-  need_cmd qrencode qrencode
-  need_cmd bc bc
+  need_cmd python3 python3
+  need_cmd openssl openssl
   need_cmd ping iputils-ping
   need_cmd ip iproute2
-  need_cmd python3 python3
+  need_cmd bc bc
 }
 
 install_xray() {
   command -v xray >/dev/null 2>&1 || \
     bash <(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh) install
+}
+
+ensure_conf_link() {
+  mkdir -p /etc/xray
+  ln -sf "$CONF" "$ETC_CONF"
+}
+
+new_uuid() {
+  cat /proc/sys/kernel/random/uuid
+}
+
+new_short_id() {
+  openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | xxd -p
+}
+
+make_keys() {
+  local raw pri pub
+  raw="$(xray x25519 2>/dev/null || true)"
+  pri="$(echo "$raw" | awk -F': ' '/Private key|PrivateKey/ {print $2}' | head -n1 | tr -d '\r')"
+  [[ -z "$pri" ]] && { echo "生成 privateKey 失败"; exit 1; }
+
+  pub="$(xray x25519 -i "$pri" 2>/dev/null | awk -F': ' '/Public key|PublicKey|Password/ {print $2}' | head -n1 | tr -d '\r')"
+  [[ -z "$pub" ]] && { echo "推导 publicKey 失败"; exit 1; }
+
+  echo "$pri|$pub"
 }
 
 get_public_ip() {
@@ -87,78 +112,17 @@ net.ipv6.conf.all.disable_ipv6=1
 net.ipv6.conf.default.disable_ipv6=1
 EOF
 
-  sysctl --system >/dev/null
+  sysctl --system >/dev/null || true
 
   local iface
   iface="$(ip route | awk '/default/ {print $5; exit}')"
-  [[ -n "$iface" ]] && tc qdisc replace dev "$iface" root fq >/dev/null 2>&1 || true
-}
-
-new_uuid() {
-  cat /proc/sys/kernel/random/uuid
-}
-
-new_short_id() {
-  openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | xxd -p
-}
-
-make_keys() {
-  local raw pri pub
-  raw="$(xray x25519 2>/dev/null || true)"
-  pri="$(echo "$raw" | awk -F': ' '/Private key|PrivateKey/ {print $2}' | head -n1 | tr -d '\r')"
-  [[ -z "$pri" ]] && { echo "生成 privateKey 失败"; return 1; }
-
-  pub="$(xray x25519 -i "$pri" 2>/dev/null | awk -F': ' '/Public key|PublicKey|Password/ {print $2}' | head -n1 | tr -d '\r')"
-  [[ -z "$pub" ]] && { echo "推导 publicKey/pbk 失败"; return 1; }
-
-  echo "$pri|$pub"
-}
-
-ensure_conf_link() {
-  mkdir -p /etc/xray
-  ln -sf "$CONF" "$ETC_CONF"
-}
-
-get_private_key() {
-  python3 - <<'PY'
-import json
-with open("/usr/local/etc/xray/config.json","r",encoding="utf-8") as f:
-    data=json.load(f)
-print(data["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"])
-PY
-}
-
-get_port() {
-  python3 - <<'PY'
-import json
-with open("/usr/local/etc/xray/config.json","r",encoding="utf-8") as f:
-    data=json.load(f)
-print(data["inbounds"][0]["port"])
-PY
-}
-
-get_short_id() {
-  python3 - <<'PY'
-import json
-with open("/usr/local/etc/xray/config.json","r",encoding="utf-8") as f:
-    data=json.load(f)
-arr=data["inbounds"][0]["streamSettings"]["realitySettings"].get("shortIds",[""])
-print(arr[0] if arr else "")
-PY
-}
-
-get_pbk() {
-  local pri
-  pri="$(get_private_key)"
-  [[ -z "$pri" ]] && return 1
-  xray x25519 -i "$pri" 2>/dev/null | awk -F': ' '/Public key|PublicKey|Password/ {print $2}' | head -n1 | tr -d '\r'
+  [[ -n "${iface:-}" ]] && tc qdisc replace dev "$iface" root fq >/dev/null 2>&1 || true
 }
 
 write_new_config() {
   local uuid="$1"
   local pri="$2"
-  local port="$3"
-  local shortid="$4"
+  local shortid="$3"
 
   mkdir -p /usr/local/etc/xray
 
@@ -169,13 +133,13 @@ write_new_config() {
   },
   "inbounds": [
     {
-      "port": $port,
+      "port": $PORT,
       "protocol": "vless",
       "settings": {
         "clients": [
           {
             "id": "$uuid",
-            "flow": "$DEFAULT_FLOW",
+            "flow": "$FLOW",
             "email": "user1"
           }
         ],
@@ -188,13 +152,9 @@ write_new_config() {
           "show": false,
           "dest": "$DOMAIN:443",
           "xver": 0,
-          "serverNames": [
-            "$DOMAIN"
-          ],
+          "serverNames": ["$DOMAIN"],
           "privateKey": "$pri",
-          "shortIds": [
-            "$shortid"
-          ]
+          "shortIds": ["$shortid"]
         }
       }
     }
@@ -212,12 +172,80 @@ EOF
   systemctl restart xray
 }
 
+repair_config() {
+python3 - <<'PY'
+import json, os, sys
+
+conf="/usr/local/etc/xray/config.json"
+domain="www.cloudflare.com"
+flow="xtls-rprx-vision"
+
+if not os.path.exists(conf):
+    sys.exit(2)
+
+with open(conf,"r",encoding="utf-8") as f:
+    data=json.load(f)
+
+if "inbounds" not in data or not data["inbounds"]:
+    sys.exit(3)
+
+changed=False
+inb=data["inbounds"][0]
+
+if inb.get("port") != 443:
+    inb["port"]=443
+    changed=True
+
+if inb.get("protocol") != "vless":
+    inb["protocol"]="vless"
+    changed=True
+
+settings=inb.setdefault("settings", {})
+settings["decryption"]="none"
+clients=settings.setdefault("clients", [])
+
+for c in clients:
+    if c.get("flow") != flow:
+        c["flow"]=flow
+        changed=True
+
+ss=inb.setdefault("streamSettings", {})
+if ss.get("network") != "tcp":
+    ss["network"]="tcp"
+    changed=True
+if ss.get("security") != "reality":
+    ss["security"]="reality"
+    changed=True
+
+rs=ss.setdefault("realitySettings", {})
+if rs.get("dest") != f"{domain}:443":
+    rs["dest"]=f"{domain}:443"
+    changed=True
+if rs.get("xver") != 0:
+    rs["xver"]=0
+    changed=True
+if rs.get("serverNames") != [domain]:
+    rs["serverNames"]=[domain]
+    changed=True
+
+shortids=rs.get("shortIds", [])
+if not shortids or not shortids[0]:
+    rs["shortIds"]=["AUTO_SHORTID_PLACEHOLDER"]
+    changed=True
+
+with open(conf,"w",encoding="utf-8") as f:
+    json.dump(data,f,ensure_ascii=False,indent=2)
+
+sys.exit(0 if changed else 1)
+PY
+}
+
 ensure_base_config() {
   install_deps
   install_xray
 
   if [[ ! -f "$CONF" ]]; then
-    local algo keys pri uuid port shortid
+    local algo keys pri uuid sid
     algo="$(choose_tcp_algo)"
     echo "自动选择 TCP 算法: $algo"
     write_sysctl "$algo"
@@ -225,44 +253,29 @@ ensure_base_config() {
     keys="$(make_keys)"
     pri="${keys%%|*}"
     uuid="$(new_uuid)"
-    port="$DEFAULT_PORT"
-    shortid="$(new_short_id)"
-
-    write_new_config "$uuid" "$pri" "$port" "$shortid"
+    sid="$(new_short_id)"
+    write_new_config "$uuid" "$pri" "$sid"
     echo "配置已初始化"
     return
   fi
 
-  # 修复旧配置：没有 flow / shortId / 软链接时自动补齐
-  python3 - <<'PY'
-import json, os, sys
-conf="/usr/local/etc/xray/config.json"
-with open(conf,"r",encoding="utf-8") as f:
-    data=json.load(f)
-
-changed=False
-
-if "inbounds" not in data:
-    print("当前配置格式异常，请删除 config.json 后重新初始化")
-    sys.exit(1)
-
-inb=data["inbounds"][0]
-clients=inb["settings"]["clients"]
-for c in clients:
-    if c.get("flow") != "xtls-rprx-vision":
-        c["flow"]="xtls-rprx-vision"
-        changed=True
-
-rs=inb["streamSettings"]["realitySettings"]
-shortids=rs.get("shortIds", [])
-if not shortids or not shortids[0]:
-    rs["shortIds"]=["AUTO_SHORTID_PLACEHOLDER"]
-    changed=True
-
-if changed:
-    with open(conf,"w",encoding="utf-8") as f:
-        json.dump(data,f,ensure_ascii=False,indent=2)
-PY
+  if repair_config; then
+    :
+  else
+    rc=$?
+    if [[ "$rc" -eq 2 || "$rc" -eq 3 ]]; then
+      echo "当前配置格式异常，正在重建..."
+      rm -f "$CONF"
+      local keys pri uuid sid
+      keys="$(make_keys)"
+      pri="${keys%%|*}"
+      uuid="$(new_uuid)"
+      sid="$(new_short_id)"
+      write_new_config "$uuid" "$pri" "$sid"
+      echo "配置已重建"
+      return
+    fi
+  fi
 
   if grep -q 'AUTO_SHORTID_PLACEHOLDER' "$CONF"; then
     local sid
@@ -275,15 +288,38 @@ PY
   echo "配置已修复"
 }
 
+get_private_key() {
+python3 - <<'PY'
+import json
+with open("/usr/local/etc/xray/config.json","r",encoding="utf-8") as f:
+    data=json.load(f)
+print(data["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"])
+PY
+}
+
+get_short_id() {
+python3 - <<'PY'
+import json
+with open("/usr/local/etc/xray/config.json","r",encoding="utf-8") as f:
+    data=json.load(f)
+print(data["inbounds"][0]["streamSettings"]["realitySettings"]["shortIds"][0])
+PY
+}
+
+get_pbk() {
+  local pri
+  pri="$(get_private_key)"
+  xray x25519 -i "$pri" 2>/dev/null | awk -F': ' '/Public key|PublicKey|Password/ {print $2}' | head -n1 | tr -d '\r'
+}
+
 list_users_raw() {
 python3 - <<'PY'
 import json
-conf="/usr/local/etc/xray/config.json"
-with open(conf,"r",encoding="utf-8") as f:
+with open("/usr/local/etc/xray/config.json","r",encoding="utf-8") as f:
     data=json.load(f)
 clients=data["inbounds"][0]["settings"]["clients"]
 for i,c in enumerate(clients,1):
-    print(f"{i}|{c.get('email','user'+str(i))}|{c.get('id','')}|{c.get('flow','')}")
+    print(f"{i}|{c.get('email','user'+str(i))}|{c.get('id','')}|{c.get('flow','xtls-rprx-vision')}")
 PY
 }
 
@@ -291,24 +327,19 @@ build_link() {
   local uuid="$1"
   local name="$2"
   local flow="$3"
-  local ip port pbk sid safe_name
-
-  port="$(get_port)"
+  local ip pbk sid
+  ip="$(get_public_ip)"
   pbk="$(get_pbk)"
   sid="$(get_short_id)"
-  ip="$(get_public_ip)"
-  safe_name="$(printf '%s' "$name" | sed 's/ /%20/g')"
-
-  echo "vless://${uuid}@${ip}:${port}?encryption=none&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${pbk}&sid=${sid}&flow=${flow}&type=tcp#${safe_name}"
+  echo "vless://${uuid}@${ip}:${PORT}?encryption=none&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${pbk}&sid=${sid}&flow=${flow}&type=tcp#${name}"
 }
 
-show_all_links() {
-  local idx name uuid flow link
+show_links() {
+  local idx name uuid flow
   while IFS='|' read -r idx name uuid flow; do
     [[ -z "$uuid" ]] && continue
-    link="$(build_link "$uuid" "$name" "$flow")"
     echo "[$idx] $name"
-    echo "$link"
+    build_link "$uuid" "$name" "$flow"
     echo
   done < <(list_users_raw)
 }
@@ -317,9 +348,14 @@ add_user() {
   local name uuid
   read -rp "请输入新用户名（如 user2）: " name
   [[ -z "$name" ]] && { echo "用户名不能为空"; return; }
+
+  echo "提示：新增用户会短暂重启 Xray，现有连接可能闪断几秒。"
+  read -rp "继续吗？(y/N): " confirm
+  [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+
   uuid="$(new_uuid)"
 
-  python3 - "$name" "$uuid" <<'PY'
+python3 - "$name" "$uuid" <<'PY'
 import json, sys
 name=sys.argv[1]
 uuid=sys.argv[2]
@@ -347,7 +383,7 @@ PY
   systemctl restart xray
   echo
   echo "已新增用户: $name"
-  echo "$(build_link "$uuid" "$name" "$DEFAULT_FLOW")"
+  build_link "$uuid" "$name" "$FLOW"
 }
 
 delete_user() {
@@ -355,7 +391,7 @@ delete_user() {
   read -rp "请输入要删除的用户名: " name
   [[ -z "$name" ]] && { echo "用户名不能为空"; return; }
 
-  python3 - "$name" <<'PY'
+python3 - "$name" <<'PY'
 import json, sys
 name=sys.argv[1]
 conf="/usr/local/etc/xray/config.json"
@@ -383,16 +419,21 @@ PY
   echo "已删除用户: $name"
 }
 
-reset_one_user() {
-  local name next_uuid
+reset_user() {
+  local name uuid
   read -rp "请输入要重置的用户名: " name
   [[ -z "$name" ]] && { echo "用户名不能为空"; return; }
-  next_uuid="$(new_uuid)"
 
-  python3 - "$name" "$next_uuid" <<'PY'
+  echo "提示：重置用户会让该用户旧链接失效，并短暂重启 Xray。"
+  read -rp "继续吗？(y/N): " confirm
+  [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+
+  uuid="$(new_uuid)"
+
+python3 - "$name" "$uuid" <<'PY'
 import json, sys
 name=sys.argv[1]
-new_uuid=sys.argv[2]
+uuid=sys.argv[2]
 conf="/usr/local/etc/xray/config.json"
 with open(conf,"r",encoding="utf-8") as f:
     data=json.load(f)
@@ -400,7 +441,7 @@ with open(conf,"r",encoding="utf-8") as f:
 found=False
 for c in data["inbounds"][0]["settings"]["clients"]:
     if c.get("email")==name:
-        c["id"]=new_uuid
+        c["id"]=uuid
         c["flow"]="xtls-rprx-vision"
         found=True
         break
@@ -417,7 +458,7 @@ PY
   systemctl restart xray
   echo
   echo "已重置用户: $name"
-  echo "$(build_link "$next_uuid" "$name" "$DEFAULT_FLOW")"
+  build_link "$uuid" "$name" "$FLOW"
 }
 
 show_status() {
@@ -429,34 +470,19 @@ restart_xray() {
   echo "Xray 已重启"
 }
 
-uninstall_xray() {
-  systemctl stop xray 2>/dev/null || true
-  systemctl disable xray 2>/dev/null || true
-  rm -f /usr/local/bin/xray
-  rm -rf /usr/local/etc/xray
-  rm -rf /usr/local/share/xray
-  rm -f /etc/systemd/system/xray.service
-  rm -f "$SYSCTL_CONF"
-  rm -f "$ETC_CONF"
-  systemctl daemon-reload
-  sysctl --system >/dev/null 2>&1 || true
-  echo "已彻底卸载"
-}
-
-menu() {
+menu_ui() {
   clear
   cat <<EOF
 ==============================
-   Xray Reality 多用户管理
+   Xray Reality 管理菜单
 ==============================
-1. 初始化/修复配置
-2. 查看所有用户链接
+1. 修复/初始化
+2. 查看链接
 3. 新增用户
 4. 删除用户
-5. 重置某个用户（旧链接失效）
-6. 查看运行状态
-7. 重启 Xray
-8. 卸载
+5. 重置用户
+6. 状态
+7. 重启
 0. 退出
 ==============================
 EOF
@@ -464,13 +490,12 @@ EOF
   read -rp "请选择: " choice
   case "$choice" in
     1) ensure_base_config ;;
-    2) show_all_links ;;
+    2) show_links ;;
     3) add_user ;;
     4) delete_user ;;
-    5) reset_one_user ;;
+    5) reset_user ;;
     6) show_status ;;
     7) restart_xray ;;
-    8) uninstall_xray ;;
     0) exit 0 ;;
     *) echo "无效选项" ;;
   esac
@@ -479,7 +504,7 @@ EOF
 ensure_base_config
 
 while true; do
-  menu
+  menu_ui
   echo
   read -rp "按回车返回菜单..." _
 done
