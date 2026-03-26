@@ -150,16 +150,13 @@ EOF
 }
 
 build_link() {
-  local uuid="$1" port="$2" pri="$3" name="$4"
-  local pub ip safe_name
+  local uuid="$1" port="$2" pri="$3"
+  local pub ip
 
   pub="$(xray x25519 -i "$pri" 2>/dev/null | awk -F': ' '/Public key|PublicKey|Password/ {print $2}' | head -n1 | tr -d '\r')"
-  [[ -z "$pub" ]] && { echo "无法推导 pbk"; return 1; }
-
   ip="$(get_public_ip)"
-  safe_name="$(printf '%s' "${name:-Live}" | sed 's/ /%20/g')"
 
-  echo "vless://${uuid}@${ip}:${port}?encryption=none&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${pub}&type=tcp&headerType=none#${safe_name}"
+  echo "vless://${uuid}@${ip}:${port}?encryption=none&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${pub}&type=tcp&headerType=none#Live"
 }
 
 show_qr() {
@@ -182,7 +179,7 @@ install_init() {
   port="443"
 
   write_config "$uuid" "$pri" "$port"
-  link="$(build_link "$uuid" "$port" "$pri" "Live")"
+  link="$(build_link "$uuid" "$port" "$pri")"
 
   echo
   echo "安装完成"
@@ -196,7 +193,8 @@ install_init() {
 }
 
 show_link() {
-  local uuid pri port name link
+  local uuid pri port link
+
   uuid="$(cfg_get '"id"\s*:\s*"\K[^"]+')"
   pri="$(cfg_get '"privateKey"\s*:\s*"\K[^"]+')"
   port="$(cfg_get '"port"\s*:\s*\K\d+')"
@@ -205,8 +203,7 @@ show_link() {
   [[ -z "$pri" ]] && { echo "未找到 privateKey"; return; }
   [[ -z "$port" ]] && port=443
 
-  read -rp "节点备注名（默认 Live）: " name
-  link="$(build_link "$uuid" "$port" "$pri" "${name:-Live}")"
+  link="$(build_link "$uuid" "$port" "$pri")"
 
   echo
   echo "$link"
@@ -227,53 +224,16 @@ reset_node() {
   [[ -z "$port" ]] && port=443
 
   write_config "$uuid" "$pri" "$port"
-  link="$(build_link "$uuid" "$port" "$pri" "Live")"
+  link="$(build_link "$uuid" "$port" "$pri")"
 
   echo
   echo "已重置节点，旧链接失效"
   echo "UUID: $uuid"
   echo "PBK: $pub"
-  echo "端口: $port"
   echo
   echo "$link"
   echo
   show_qr "$link"
-}
-
-change_port() {
-  local uuid pri port
-  uuid="$(cfg_get '"id"\s*:\s*"\K[^"]+')"
-  pri="$(cfg_get '"privateKey"\s*:\s*"\K[^"]+')"
-
-  [[ -z "$uuid" ]] && { echo "未找到现有配置"; return; }
-  [[ -z "$pri" ]] && { echo "未找到 privateKey"; return; }
-
-  read -rp "请输入新端口: " port
-  [[ -z "$port" ]] && { echo "端口不能为空"; return; }
-
-  write_config "$uuid" "$pri" "$port"
-  echo "端口已修改为: $port"
-}
-
-restart_xray() {
-  systemctl restart xray
-  echo "Xray 已重启"
-}
-
-show_status() {
-  systemctl status xray --no-pager -l
-}
-
-uninstall_xray() {
-  systemctl stop xray 2>/dev/null || true
-  systemctl disable xray 2>/dev/null || true
-  rm -f /usr/local/bin/xray
-  rm -rf /usr/local/etc/xray
-  rm -f /etc/systemd/system/xray.service
-  rm -f "$SYSCTL_CONF"
-  systemctl daemon-reload
-  sysctl --system >/dev/null 2>&1 || true
-  echo "已卸载完成"
 }
 
 menu() {
@@ -296,22 +256,22 @@ EOF
   case "$choice" in
     1) show_link ;;
     2) reset_node ;;
-    3) change_port ;;
-    4) restart_xray ;;
-    5) show_status ;;
-    6) uninstall_xray ;;
+    3) echo "暂未实现" ;;
+    4) systemctl restart xray ;;
+    5) systemctl status xray --no-pager -l ;;
+    6) echo "请手动卸载" ;;
     0) exit 0 ;;
     *) echo "无效选项" ;;
   esac
 }
 
-# 首次运行：未安装则直接自动安装并输出链接
+# 首次运行
 if [[ ! -f "$CONF" ]]; then
   install_init
   exit 0
 fi
 
-# 已安装：进入菜单
+# 后续运行
 while true; do
   menu
   echo
