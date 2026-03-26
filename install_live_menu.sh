@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="live_menu"
-SCRIPT_NAME="live_menu.sh"
-
-REAL_PATH="/usr/local/bin/${APP_NAME}.real"
-WRAPPER_PATH="/usr/local/bin/${APP_NAME}"
-BACKUP_DIR="/usr/local/lib/${APP_NAME}"
+APP_NAME="menu"
+REAL_PATH="/usr/local/bin/live_menu.real"
+MENU_PATH="/usr/local/bin/menu"
+COMPAT_PATH="/usr/local/bin/live_menu"
+BACKUP_DIR="/usr/local/lib/live_menu"
 LOCAL_INSTALLER="/root/install_live_menu.sh"
+SCRIPT_NAME="live_menu.sh"
 
 URLS=(
   "https://raw.githubusercontent.com/jacksun681/live-deploy/main/${SCRIPT_NAME}"
@@ -23,13 +23,14 @@ need_cmd() {
 
 normalize_file() {
   local f="$1"
+  [[ -f "$f" ]] || return 0
   sed -i 's/\r$//' "$f" 2>/dev/null || true
 }
 
 download_main() {
-  local url tmp
+  local url tmp=""
   tmp="$(mktemp)"
-  trap 'rm -f "$tmp"' RETURN
+  trap '[ -n "${tmp:-}" ] && rm -f "$tmp"' RETURN
 
   for url in "${URLS[@]}"; do
     echo "[尝试下载] $url"
@@ -74,7 +75,7 @@ download_main() {
 }
 
 create_wrapper() {
-  cat > "$WRAPPER_PATH" <<'EOF'
+  cat > "$MENU_PATH" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -94,10 +95,13 @@ case "${1:-run}" in
   help|-h|--help)
     cat <<EOT
 用法:
-  live_menu           运行菜单
-  live_menu update    从远端更新本地版本
-  live_menu rollback  回滚到上一个版本
-  live_menu path      查看本地路径
+  menu            运行菜单
+  menu update     更新本地版本
+  menu rollback   回滚到上一个版本
+  menu path       查看主程序路径
+
+兼容旧命令:
+  live_menu
 EOT
     ;;
   *)
@@ -107,8 +111,9 @@ EOT
 esac
 EOF
 
-  chmod +x "$WRAPPER_PATH"
-  normalize_file "$WRAPPER_PATH"
+  chmod +x "$MENU_PATH"
+  normalize_file "$MENU_PATH"
+  ln -sf "$MENU_PATH" "$COMPAT_PATH"
 }
 
 rollback_main() {
@@ -119,29 +124,26 @@ rollback_main() {
   echo "[回滚完成]"
 }
 
-show_path() {
-  echo "$REAL_PATH"
-}
-
 show_help() {
   cat <<EOF
 用法:
-  bash /root/install_live_menu.sh install   安装/更新到本地
-  bash /root/install_live_menu.sh rollback  回滚到上一个版本
-  bash /root/install_live_menu.sh path      查看安装路径
+  bash /root/install_live_menu.sh install   安装/更新
+  bash /root/install_live_menu.sh rollback  回滚
+  bash /root/install_live_menu.sh path      查看路径
 
-安装完成后可直接使用:
+安装后可直接使用:
+  menu
+  menu update
+  menu rollback
+  menu path
+
+兼容旧命令:
   live_menu
-  live_menu update
-  live_menu rollback
-  live_menu path
 EOF
 }
 
 self_fix() {
-  if [[ -f "$LOCAL_INSTALLER" ]]; then
-    normalize_file "$LOCAL_INSTALLER"
-  fi
+  [[ -f "$LOCAL_INSTALLER" ]] && normalize_file "$LOCAL_INSTALLER"
 }
 
 main() {
@@ -152,13 +154,13 @@ main() {
     install)
       download_main
       create_wrapper
-      echo "[完成] 现在可直接运行: live_menu"
+      echo "[完成] 现在可直接运行: menu"
       ;;
     rollback)
       rollback_main
       ;;
     path)
-      show_path
+      echo "$REAL_PATH"
       ;;
     *)
       show_help
