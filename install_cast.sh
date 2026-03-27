@@ -3,15 +3,23 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
-REAL_PATH="/usr/local/bin/cast.real"
+MENU_REAL="/usr/local/bin/cast_menu.real"
+DOCTOR_REAL="/usr/local/bin/cast_doctor.real"
 CMD_PATH="/usr/local/bin/cast"
 BACKUP_DIR="/usr/local/lib/cast"
 LOCAL_INSTALLER="/root/install_cast.sh"
-SCRIPT_NAME="cast_menu.sh"
 
-URLS=(
-  "https://raw.githubusercontent.com/jacksun681/live-deploy/main/${SCRIPT_NAME}"
-  "https://cdn.jsdelivr.net/gh/jacksun681/live-deploy@main/${SCRIPT_NAME}"
+MENU_SCRIPT="cast_menu.sh"
+DOCTOR_SCRIPT="cast_doctor.sh"
+
+MENU_URLS=(
+  "https://raw.githubusercontent.com/jacksun681/live-deploy/main/${MENU_SCRIPT}"
+  "https://cdn.jsdelivr.net/gh/jacksun681/live-deploy@main/${MENU_SCRIPT}"
+)
+
+DOCTOR_URLS=(
+  "https://raw.githubusercontent.com/jacksun681/live-deploy/main/${DOCTOR_SCRIPT}"
+  "https://cdn.jsdelivr.net/gh/jacksun681/live-deploy@main/${DOCTOR_SCRIPT}"
 )
 
 need_cmd() {
@@ -44,12 +52,14 @@ install_deps() {
   need_cmd jq jq
 }
 
-download_main() {
-  local url tmp=""
+download_one() {
+  local dest="$1"
+  shift
+  local tmp=""
   tmp="$(mktemp)"
   trap '[ -n "${tmp:-}" ] && rm -f "$tmp"' RETURN
 
-  for url in "${URLS[@]}"; do
+  for url in "$@"; do
     echo "[尝试下载] $url"
 
     if ! curl -fsSL --max-time 20 "$url" -o "$tmp" 2>/dev/null; then
@@ -74,20 +84,19 @@ download_main() {
       continue
     fi
 
-    mkdir -p "$BACKUP_DIR"
-    if [[ -f "$REAL_PATH" ]]; then
-      cp "$REAL_PATH" "$BACKUP_DIR/cast.last"
-      cp "$REAL_PATH" "$BACKUP_DIR/cast.$(date +%F-%H%M%S).bak"
-    fi
-
-    install -m 755 "$tmp" "$REAL_PATH"
-    normalize_file "$REAL_PATH"
-    echo "[成功] 已安装到 $REAL_PATH"
+    install -m 755 "$tmp" "$dest"
+    normalize_file "$dest"
+    echo "[成功] 已安装到 $dest"
     return 0
   done
 
-  echo "所有下载源都失败了"
   return 1
+}
+
+backup_old() {
+  mkdir -p "$BACKUP_DIR"
+  [[ -f "$MENU_REAL" ]] && cp "$MENU_REAL" "$BACKUP_DIR/cast_menu.last"
+  [[ -f "$DOCTOR_REAL" ]] && cp "$DOCTOR_REAL" "$BACKUP_DIR/cast_doctor.last"
 }
 
 create_wrapper() {
@@ -95,10 +104,19 @@ create_wrapper() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-REAL_PATH="/usr/local/bin/cast.real"
+MENU_REAL="/usr/local/bin/cast_menu.real"
+DOCTOR_REAL="/usr/local/bin/cast_doctor.real"
 INSTALLER="/root/install_cast.sh"
 
-case "${1:-run}" in
+case "${1:-menu}" in
+  doctor)
+    shift
+    exec bash "$DOCTOR_REAL" doctor "$@"
+    ;;
+  watch)
+    shift
+    exec bash "$DOCTOR_REAL" watch "$@"
+    ;;
   update)
     exec bash "$INSTALLER" install
     ;;
@@ -106,13 +124,13 @@ case "${1:-run}" in
     exec bash "$INSTALLER" rollback
     ;;
   path)
-    echo "$REAL_PATH"
+    echo "$MENU_REAL"
     ;;
   help|-h|--help)
     cat <<EOT
 用法:
   cast            打开菜单
-  cast doctor     一次性诊断
+  cast doctor     一次性诊断菜单
   cast watch      实时监控
   cast update     更新本地版本
   cast rollback   回滚到上一个版本
@@ -120,8 +138,7 @@ case "${1:-run}" in
 EOT
     ;;
   *)
-    [[ -f "$REAL_PATH" ]] || { echo "主程序不存在，请先执行安装"; exit 1; }
-    exec bash "$REAL_PATH" "$@"
+    exec bash "$MENU_REAL" "$@"
     ;;
 esac
 EOF
@@ -131,10 +148,12 @@ EOF
 }
 
 rollback_main() {
-  local last="${BACKUP_DIR}/cast.last"
-  [[ -f "$last" ]] || { echo "没有可回滚版本"; exit 1; }
-  cp "$last" "$REAL_PATH"
-  chmod +x "$REAL_PATH"
+  [[ -f "$BACKUP_DIR/cast_menu.last" ]] || { echo "没有可回滚版本"; exit 1; }
+  [[ -f "$BACKUP_DIR/cast_doctor.last" ]] || { echo "没有可回滚版本"; exit 1; }
+
+  cp "$BACKUP_DIR/cast_menu.last" "$MENU_REAL"
+  cp "$BACKUP_DIR/cast_doctor.last" "$DOCTOR_REAL"
+  chmod +x "$MENU_REAL" "$DOCTOR_REAL"
   create_wrapper
   echo "[回滚完成]"
 }
@@ -159,10 +178,10 @@ self_fix() {
 }
 
 first_bootstrap() {
-  if [[ -x "$REAL_PATH" ]]; then
+  if [[ -x "$MENU_REAL" ]]; then
     echo
     echo "[初始化] 正在自动初始化并输出主链接..."
-    bash "$REAL_PATH" --bootstrap || true
+    bash "$MENU_REAL" --bootstrap || true
   fi
 }
 
@@ -173,7 +192,9 @@ main() {
 
   case "${1:-help}" in
     install)
-      download_main
+      backup_old
+      download_one "$MENU_REAL" "${MENU_URLS[@]}" || { echo "下载 cast_menu.sh 失败"; exit 1; }
+      download_one "$DOCTOR_REAL" "${DOCTOR_URLS[@]}" || { echo "下载 cast_doctor.sh 失败"; exit 1; }
       create_wrapper
       echo "[完成] 已安装命令: cast"
       first_bootstrap
@@ -182,7 +203,7 @@ main() {
       rollback_main
       ;;
     path)
-      echo "$REAL_PATH"
+      echo "$MENU_REAL"
       ;;
     *)
       show_help
