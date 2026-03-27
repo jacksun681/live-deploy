@@ -21,6 +21,7 @@ install_deps() {
   need_cmd curl curl
   need_cmd python3 python3
   need_cmd openssl openssl
+  need_cmd jq jq
   need_cmd ping iputils-ping
   need_cmd ip iproute2
   need_cmd bc bc
@@ -61,6 +62,7 @@ get_public_ip() {
   ip="$(curl -4 -s https://api.ipify.org || true)"
   [[ -z "$ip" ]] && ip="$(curl -4 -s https://ifconfig.me || true)"
   [[ -z "$ip" ]] && ip="$(curl -4 -s https://ip.sb || true)"
+  [[ -z "$ip" ]] && ip="$(hostname -I | awk '{print $1}')"
   [[ -z "$ip" ]] && read -rp "请输入公网 IP: " ip
   echo "$ip"
 }
@@ -174,7 +176,7 @@ EOF
 
 repair_config() {
 python3 - <<'PY'
-import json, os, sys
+import json, os, sys, subprocess, secrets
 
 conf="/usr/local/etc/xray/config.json"
 domain="www.cloudflare.com"
@@ -186,7 +188,7 @@ if not os.path.exists(conf):
 with open(conf,"r",encoding="utf-8") as f:
     data=json.load(f)
 
-if "inbounds" not in data or not data["inbounds"]:
+if "inbounds" not in data or not isinstance(data["inbounds"], list) or not data["inbounds"]:
     sys.exit(3)
 
 changed=False
@@ -200,37 +202,78 @@ if inb.get("protocol") != "vless":
     inb["protocol"]="vless"
     changed=True
 
-settings=inb.setdefault("settings", {})
+settings=inb.get("settings")
+if not isinstance(settings, dict):
+    settings={}
+    inb["settings"]=settings
+    changed=True
+
 settings["decryption"]="none"
-clients=settings.setdefault("clients", [])
+
+clients=settings.get("clients")
+if not isinstance(clients, list):
+    clients=[]
+    settings["clients"]=clients
+    changed=True
 
 for c in clients:
     if c.get("flow") != flow:
         c["flow"]=flow
         changed=True
 
-ss=inb.setdefault("streamSettings", {})
+ss=inb.get("streamSettings")
+if not isinstance(ss, dict):
+    ss={}
+    inb["streamSettings"]=ss
+    changed=True
+
 if ss.get("network") != "tcp":
     ss["network"]="tcp"
     changed=True
+
 if ss.get("security") != "reality":
     ss["security"]="reality"
     changed=True
 
-rs=ss.setdefault("realitySettings", {})
+rs=ss.get("realitySettings")
+if not isinstance(rs, dict):
+    rs={}
+    ss["realitySettings"]=rs
+    changed=True
+
+if rs.get("show") is not False:
+    rs["show"]=False
+    changed=True
+
 if rs.get("dest") != f"{domain}:443":
     rs["dest"]=f"{domain}:443"
     changed=True
+
 if rs.get("xver") != 0:
     rs["xver"]=0
     changed=True
+
 if rs.get("serverNames") != [domain]:
     rs["serverNames"]=[domain]
     changed=True
 
-shortids=rs.get("shortIds", [])
-if not shortids or not shortids[0]:
-    rs["shortIds"]=["AUTO_SHORTID_PLACEHOLDER"]
+pk = rs.get("privateKey")
+if not pk:
+    raw = subprocess.check_output(["bash","-lc","xray x25519"], text=True)
+    pri = ""
+    for line in raw.splitlines():
+        if "Private key" in line or "PrivateKey" in line:
+            pri = line.split(": ",1)[1].strip()
+            break
+    if not pri:
+        print("生成 privateKey 失败")
+        sys.exit(4)
+    rs["privateKey"] = pri
+    changed=True
+
+shortids = rs.get("shortIds")
+if not isinstance(shortids, list) or not shortids or not shortids[0]:
+    rs["shortIds"]=[secrets.token_hex(8)]
     changed=True
 
 with open(conf,"w",encoding="utf-8") as f:
@@ -266,7 +309,11 @@ ensure_base_config() {
     if [[ "$rc" -eq 2 || "$rc" -eq 3 ]]; then
       echo "当前配置格式异常，正在重建..."
       rm -f "$CONF"
-      local keys pri uuid sid
+      local algo keys pri uuid sid
+      algo="$(choose_tcp_algo)"
+      echo "自动选择 TCP 算法: $algo"
+      write_sysctl "$algo"
+
       keys="$(make_keys)"
       pri="${keys%%|*}"
       uuid="$(new_uuid)"
@@ -275,12 +322,6 @@ ensure_base_config() {
       echo "配置已重建"
       return
     fi
-  fi
-
-  if grep -q 'AUTO_SHORTID_PLACEHOLDER' "$CONF"; then
-    local sid
-    sid="$(new_short_id)"
-    sed -i "s/AUTO_SHORTID_PLACEHOLDER/${sid}/g" "$CONF"
   fi
 
   ensure_conf_link
@@ -293,7 +334,7 @@ python3 - <<'PY'
 import json
 with open("/usr/local/etc/xray/config.json","r",encoding="utf-8") as f:
     data=json.load(f)
-print(data["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"])
+print(data["inbounds"][0]["streamSettings"]["realitySettings"].get("privateKey",""))
 PY
 }
 
@@ -302,13 +343,21 @@ python3 - <<'PY'
 import json
 with open("/usr/local/etc/xray/config.json","r",encoding="utf-8") as f:
     data=json.load(f)
-print(data["inbounds"][0]["streamSettings"]["realitySettings"]["shortIds"][0])
+shortids=data["inbounds"][0]["streamSettings"]["realitySettings"].get("shortIds", [])
+print(shortids[0] if shortids else "")
 PY
 }
 
 get_pbk() {
   local pri
-  pri="$(get_private_key)"
+  pri="$(python3 - <<'PY'
+import json
+with open("/usr/local/etc/xray/config.json","r",encoding="utf-8") as f:
+    data=json.load(f)
+print(data["inbounds"][0]["streamSettings"]["realitySettings"].get("privateKey",""))
+PY
+)"
+  [[ -z "$pri" ]] && return 1
   xray x25519 -i "$pri" 2>/dev/null | awk -F': ' '/Public key|PublicKey|Password/ {print $2}' | head -n1 | tr -d '\r'
 }
 
@@ -317,7 +366,8 @@ python3 - <<'PY'
 import json
 with open("/usr/local/etc/xray/config.json","r",encoding="utf-8") as f:
     data=json.load(f)
-clients=data["inbounds"][0]["settings"]["clients"]
+
+clients=data["inbounds"][0].get("settings", {}).get("clients", [])
 for i,c in enumerate(clients,1):
     print(f"{i}|{c.get('email','user'+str(i))}|{c.get('id','')}|{c.get('flow','xtls-rprx-vision')}")
 PY
@@ -331,10 +381,13 @@ build_link() {
   ip="$(get_public_ip)"
   pbk="$(get_pbk)"
   sid="$(get_short_id)"
-  echo "vless://${uuid}@${ip}:${PORT}?encryption=none&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${pbk}&sid=${sid}&flow=${flow}&type=tcp#${name}"
+  [[ -z "$pbk" ]] && { echo "生成 pbk 失败"; return 1; }
+  [[ -z "$sid" ]] && { echo "shortId 缺失"; return 1; }
+  echo "vless://${uuid}@${ip}:${PORT}?encryption=none&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${pbk}&sid=${sid}&flow=${flow}&type=tcp&headerType=none#${name}"
 }
 
 show_links() {
+  ensure_base_config
   local idx name uuid flow
   while IFS='|' read -r idx name uuid flow; do
     [[ -z "$uuid" ]] && continue
@@ -345,6 +398,7 @@ show_links() {
 }
 
 add_user() {
+  ensure_base_config
   local name uuid
   read -rp "请输入新用户名（如 user2）: " name
   [[ -z "$name" ]] && { echo "用户名不能为空"; return; }
@@ -363,7 +417,9 @@ conf="/usr/local/etc/xray/config.json"
 with open(conf,"r",encoding="utf-8") as f:
     data=json.load(f)
 
-clients=data["inbounds"][0]["settings"]["clients"]
+settings = data["inbounds"][0].setdefault("settings", {})
+clients = settings.setdefault("clients", [])
+
 for c in clients:
     if c.get("email")==name:
         print("该用户名已存在")
@@ -387,6 +443,7 @@ PY
 }
 
 delete_user() {
+  ensure_base_config
   local name
   read -rp "请输入要删除的用户名: " name
   [[ -z "$name" ]] && { echo "用户名不能为空"; return; }
@@ -398,7 +455,9 @@ conf="/usr/local/etc/xray/config.json"
 with open(conf,"r",encoding="utf-8") as f:
     data=json.load(f)
 
-clients=data["inbounds"][0]["settings"]["clients"]
+settings = data["inbounds"][0].setdefault("settings", {})
+clients = settings.setdefault("clients", [])
+
 new_clients=[c for c in clients if c.get("email") != name]
 
 if len(new_clients)==len(clients):
@@ -420,6 +479,7 @@ PY
 }
 
 reset_user() {
+  ensure_base_config
   local name uuid
   read -rp "请输入要重置的用户名: " name
   [[ -z "$name" ]] && { echo "用户名不能为空"; return; }
@@ -438,8 +498,11 @@ conf="/usr/local/etc/xray/config.json"
 with open(conf,"r",encoding="utf-8") as f:
     data=json.load(f)
 
+settings = data["inbounds"][0].setdefault("settings", {})
+clients = settings.setdefault("clients", [])
+
 found=False
-for c in data["inbounds"][0]["settings"]["clients"]:
+for c in clients:
     if c.get("email")==name:
         c["id"]=uuid
         c["flow"]="xtls-rprx-vision"
