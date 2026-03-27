@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export DEBIAN_FRONTEND=noninteractive
+
 CONF="/usr/local/etc/xray/config.json"
 ETC_CONF="/etc/xray/config.json"
 SYSCTL_CONF="/etc/sysctl.d/99-live.conf"
@@ -12,8 +14,11 @@ FLOW="xtls-rprx-vision"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
-    apt update -y
-    apt install -y "$2"
+    apt-get update -yq
+    apt-get install -yq \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confold" \
+      "$2"
   }
 }
 
@@ -290,7 +295,6 @@ ensure_base_config() {
   if [[ ! -f "$CONF" ]]; then
     local algo keys pri uuid sid
     algo="$(choose_tcp_algo)"
-    echo "自动选择 TCP 算法: $algo"
     write_sysctl "$algo"
 
     keys="$(make_keys)"
@@ -298,7 +302,6 @@ ensure_base_config() {
     uuid="$(new_uuid)"
     sid="$(new_short_id)"
     write_new_config "$uuid" "$pri" "$sid"
-    echo "配置已初始化"
     return
   fi
 
@@ -307,11 +310,9 @@ ensure_base_config() {
   else
     rc=$?
     if [[ "$rc" -eq 2 || "$rc" -eq 3 ]]; then
-      echo "当前配置格式异常，正在重建..."
       rm -f "$CONF"
       local algo keys pri uuid sid
       algo="$(choose_tcp_algo)"
-      echo "自动选择 TCP 算法: $algo"
       write_sysctl "$algo"
 
       keys="$(make_keys)"
@@ -319,14 +320,12 @@ ensure_base_config() {
       uuid="$(new_uuid)"
       sid="$(new_short_id)"
       write_new_config "$uuid" "$pri" "$sid"
-      echo "配置已重建"
       return
     fi
   fi
 
   ensure_conf_link
   systemctl restart xray
-  echo "配置已修复"
 }
 
 get_private_key() {
@@ -386,6 +385,61 @@ build_link() {
   echo "vless://${uuid}@${ip}:${PORT}?encryption=none&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${pbk}&sid=${sid}&flow=${flow}&type=tcp&headerType=none#${name}"
 }
 
+ensure_default_user() {
+  local count
+  count="$(python3 - <<'PY'
+import json, os
+conf="/usr/local/etc/xray/config.json"
+if not os.path.exists(conf):
+    print(0)
+else:
+    with open(conf,"r",encoding="utf-8") as f:
+        data=json.load(f)
+    print(len(data["inbounds"][0].get("settings", {}).get("clients", [])))
+PY
+)"
+  if [[ "$count" -eq 0 ]]; then
+    python3 - "$(new_uuid)" <<'PY'
+import json, sys
+uuid=sys.argv[1]
+conf="/usr/local/etc/xray/config.json"
+with open(conf,"r",encoding="utf-8") as f:
+    data=json.load(f)
+
+settings = data["inbounds"][0].setdefault("settings", {})
+clients = settings.setdefault("clients", [])
+
+clients.append({
+    "id": uuid,
+    "flow": "xtls-rprx-vision",
+    "email": "user1"
+})
+
+with open(conf,"w",encoding="utf-8") as f:
+    json.dump(data,f,ensure_ascii=False,indent=2)
+PY
+    ensure_conf_link
+    systemctl restart xray
+  fi
+}
+
+print_first_link() {
+  ensure_base_config
+  ensure_default_user
+  local idx name uuid flow
+  while IFS='|' read -r idx name uuid flow; do
+    [[ -z "$uuid" ]] && continue
+    echo
+    echo "====== 部署完成 ======"
+    echo
+    build_link "$uuid" "$name" "$flow"
+    echo
+    echo "管理命令: menu"
+    echo
+    break
+  done < <(list_users_raw)
+}
+
 show_links() {
   ensure_base_config
   local idx name uuid flow
@@ -402,10 +456,6 @@ add_user() {
   local name uuid
   read -rp "请输入新用户名（如 user2）: " name
   [[ -z "$name" ]] && { echo "用户名不能为空"; return; }
-
-  echo "提示：新增用户会短暂重启 Xray，现有连接可能闪断几秒。"
-  read -rp "继续吗？(y/N): " confirm
-  [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
 
   uuid="$(new_uuid)"
 
@@ -440,6 +490,7 @@ PY
   echo
   echo "已新增用户: $name"
   build_link "$uuid" "$name" "$FLOW"
+  echo
 }
 
 delete_user() {
@@ -484,10 +535,6 @@ reset_user() {
   read -rp "请输入要重置的用户名: " name
   [[ -z "$name" ]] && { echo "用户名不能为空"; return; }
 
-  echo "提示：重置用户会让该用户旧链接失效，并短暂重启 Xray。"
-  read -rp "继续吗？(y/N): " confirm
-  [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
-
   uuid="$(new_uuid)"
 
 python3 - "$name" "$uuid" <<'PY'
@@ -522,6 +569,7 @@ PY
   echo
   echo "已重置用户: $name"
   build_link "$uuid" "$name" "$FLOW"
+  echo
 }
 
 show_status() {
@@ -552,7 +600,7 @@ EOF
 
   read -rp "请选择: " choice
   case "$choice" in
-    1) ensure_base_config ;;
+    1) ensure_base_config; echo "配置已修复/初始化" ;;
     2) show_links ;;
     3) add_user ;;
     4) delete_user ;;
@@ -564,7 +612,12 @@ EOF
   esac
 }
 
-ensure_base_config
+case "${1:-}" in
+  --bootstrap)
+    print_first_link
+    exit 0
+    ;;
+esac
 
 while true; do
   menu_ui
