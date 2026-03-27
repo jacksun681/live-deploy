@@ -50,6 +50,13 @@ new_short_id() {
   openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | xxd -p
 }
 
+new_short_ids_json() {
+python3 - <<'PY'
+import json, secrets
+print(json.dumps([secrets.token_hex(8) for _ in range(4)]))
+PY
+}
+
 make_keys() {
   local raw pri pub
   raw="$(xray x25519 2>/dev/null || true)"
@@ -129,7 +136,7 @@ EOF
 write_new_config() {
   local uuid="$1"
   local pri="$2"
-  local shortid="$3"
+  local shortids_json="$3"
 
   mkdir -p /usr/local/etc/xray
 
@@ -155,13 +162,17 @@ write_new_config() {
       "streamSettings": {
         "network": "tcp",
         "security": "reality",
+        "sockopt": {
+          "tcpKeepAliveIdle": 30,
+          "tcpKeepAliveInterval": 10
+        },
         "realitySettings": {
           "show": false,
           "dest": "$DOMAIN:443",
           "xver": 0,
           "serverNames": ["$DOMAIN"],
           "privateKey": "$pri",
-          "shortIds": ["$shortid"]
+          "shortIds": $shortids_json
         }
       }
     }
@@ -240,6 +251,20 @@ if ss.get("security") != "reality":
     ss["security"]="reality"
     changed=True
 
+sockopt=ss.get("sockopt")
+if not isinstance(sockopt, dict):
+    sockopt={}
+    ss["sockopt"]=sockopt
+    changed=True
+
+if sockopt.get("tcpKeepAliveIdle") != 30:
+    sockopt["tcpKeepAliveIdle"]=30
+    changed=True
+
+if sockopt.get("tcpKeepAliveInterval") != 10:
+    sockopt["tcpKeepAliveInterval"]=10
+    changed=True
+
 rs=ss.get("realitySettings")
 if not isinstance(rs, dict):
     rs={}
@@ -278,7 +303,7 @@ if not pk:
 
 shortids = rs.get("shortIds")
 if not isinstance(shortids, list) or not shortids or not shortids[0]:
-    rs["shortIds"]=[secrets.token_hex(8)]
+    rs["shortIds"]=[secrets.token_hex(8) for _ in range(4)]
     changed=True
 
 with open(conf,"w",encoding="utf-8") as f:
@@ -293,15 +318,15 @@ ensure_base_config() {
   install_xray
 
   if [[ ! -f "$CONF" ]]; then
-    local algo keys pri uuid sid
+    local algo keys pri uuid shortids_json
     algo="$(choose_tcp_algo)"
     write_sysctl "$algo"
 
     keys="$(make_keys)"
     pri="${keys%%|*}"
     uuid="$(new_uuid)"
-    sid="$(new_short_id)"
-    write_new_config "$uuid" "$pri" "$sid"
+    shortids_json="$(new_short_ids_json)"
+    write_new_config "$uuid" "$pri" "$shortids_json"
     return
   fi
 
@@ -311,15 +336,15 @@ ensure_base_config() {
     rc=$?
     if [[ "$rc" -eq 2 || "$rc" -eq 3 ]]; then
       rm -f "$CONF"
-      local algo keys pri uuid sid
+      local algo keys pri uuid shortids_json
       algo="$(choose_tcp_algo)"
       write_sysctl "$algo"
 
       keys="$(make_keys)"
       pri="${keys%%|*}"
       uuid="$(new_uuid)"
-      sid="$(new_short_id)"
-      write_new_config "$uuid" "$pri" "$sid"
+      shortids_json="$(new_short_ids_json)"
+      write_new_config "$uuid" "$pri" "$shortids_json"
       return
     fi
   fi
