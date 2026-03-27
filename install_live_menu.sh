@@ -168,7 +168,7 @@ self_fix() {
 first_bootstrap() {
   if [[ -x "$REAL_PATH" ]]; then
     echo
-    echo "[初始化] 正在自动初始化并输出链接..."
+    echo "[初始化] 正在自动初始化并输出主链接..."
     bash "$REAL_PATH" --bootstrap || true
   fi
 }
