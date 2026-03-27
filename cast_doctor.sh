@@ -623,29 +623,44 @@ live_sim_diag() {
 }
 
 watch_once() {
-  local xray_state cpu mem conn_count hk_stats gl_stats hk_avg hk_loss hk_jit gl_avg gl_loss gl_jit
+  local xray_state cpu mem conn_count https_ok
+  local hk_stats gl_stats hk_avg hk_loss hk_jit gl_avg gl_loss gl_jit
+  local verdict detail
+
   xray_state="$(systemctl is-active xray 2>/dev/null || true)"
   cpu="$(cpu_usage)"
   mem="$(mem_usage)"
-  conn_count="$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l | awk '{print $1}')"
 
+  conn_count="$(ss -ant 2>/dev/null | awk '/:443 / || /:443$/ {c++} END{print c+0}')"
+
+  if curl -I -s --max-time 5 https://www.cloudflare.com >/dev/null 2>&1; then
+    https_ok="OK"
+  else
+    https_ok="FAIL"
+  fi
+
+  # TCP检测保留做参考，不再直接作为唯一判定依据
   hk_stats="$(tcp_probe "$HK_TEST_TARGET" 443 2 1 "香港")"
   gl_stats="$(tcp_probe "$GLOBAL_TEST_TARGET" 443 2 1 "全球")"
 
   IFS='|' read -r _ hk_avg _ hk_loss hk_jit <<< "$hk_stats"
   IFS='|' read -r _ gl_avg _ gl_loss gl_jit <<< "$gl_stats"
 
-  local verdict
   if [[ "$xray_state" != "active" ]]; then
     verdict="服务异常"
-  elif (( $(echo "$hk_loss >= 5 || $hk_jit >= 20" | bc -l) )); then
-    verdict="香港链路波动"
-  elif (( $(echo "$gl_loss >= 5 || $gl_jit >= 25" | bc -l) )); then
-    verdict="全球出口波动"
+    detail="Xray 未运行"
+  elif [[ "$https_ok" != "OK" ]]; then
+    verdict="出口异常"
+    detail="HTTPS 不通"
   elif (( $(echo "$cpu >= 90 || $mem >= 90" | bc -l) )); then
     verdict="资源异常"
+    detail="CPU 或内存过高"
+  elif [[ "$conn_count" -ge 1 ]]; then
+    verdict="直播正常"
+    detail="链路活跃"
   else
-    verdict="正常"
+    verdict="空闲"
+    detail="未检测到明显推流连接"
   fi
 
   clear
@@ -658,12 +673,14 @@ watch_once() {
   echo "Xray: $xray_state"
   echo "CPU: ${cpu}%"
   echo "内存: ${mem}%"
-  echo "连接数: $conn_count"
+  echo "443连接数: $conn_count"
+  echo "HTTPS出口: $https_ok"
   echo
-  echo "香港: ${hk_avg}ms / loss ${hk_loss}% / jitter ${hk_jit}ms"
-  echo "全球: ${gl_avg}ms / loss ${gl_loss}% / jitter ${gl_jit}ms"
+  echo "香港TCP: ${hk_avg}ms / loss ${hk_loss}% / jitter ${hk_jit}ms"
+  echo "全球TCP: ${gl_avg}ms / loss ${gl_loss}% / jitter ${gl_jit}ms"
   echo
   echo "状态: $verdict"
+  echo "说明: $detail"
   echo
   echo "按 Ctrl + C 退出"
 }
