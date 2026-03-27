@@ -1,4 +1,3 @@
-cat > /root/cast_doctor.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -392,8 +391,7 @@ deep_diag() {
   ok "深度诊断完成，日志已保存: $logfile"
   echo
 }
-EOF
-cat >> /root/cast_doctor.sh <<'EOF'
+
 live_sim_diag() {
   local duration=120
   local interval=5
@@ -751,6 +749,3 @@ main() {
 }
 
 main "$@"
-EOF
-
-chmod +x /root/cast_doctor.sh
