@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="menu"
 REAL_PATH="/usr/local/bin/live_menu.real"
 MENU_PATH="/usr/local/bin/menu"
 COMPAT_PATH="/usr/local/bin/live_menu"
@@ -27,6 +26,20 @@ normalize_file() {
   sed -i 's/\r$//' "$f" 2>/dev/null || true
 }
 
+precheck() {
+  [[ "$(id -u)" -eq 0 ]] || { echo "请用 root 运行"; exit 1; }
+  command -v systemctl >/dev/null 2>&1 || { echo "系统缺少 systemd"; exit 1; }
+  case "$(uname -m)" in
+    x86_64|aarch64) ;;
+    *) echo "暂不支持此架构: $(uname -m)"; exit 1 ;;
+  esac
+}
+
+install_deps() {
+  need_cmd curl curl
+  need_cmd jq jq
+}
+
 download_main() {
   local url tmp=""
   tmp="$(mktemp)"
@@ -35,7 +48,7 @@ download_main() {
   for url in "${URLS[@]}"; do
     echo "[尝试下载] $url"
 
-    if ! curl -fsSL --max-time 15 "$url" -o "$tmp" 2>/dev/null; then
+    if ! curl -fsSL --max-time 20 "$url" -o "$tmp" 2>/dev/null; then
       echo "[失败] 下载失败"
       continue
     fi
@@ -121,6 +134,7 @@ rollback_main() {
   [[ -f "$last" ]] || { echo "没有可回滚版本"; exit 1; }
   cp "$last" "$REAL_PATH"
   chmod +x "$REAL_PATH"
+  create_wrapper
   echo "[回滚完成]"
 }
 
@@ -148,7 +162,8 @@ self_fix() {
 
 main() {
   self_fix
-  need_cmd curl curl
+  precheck
+  install_deps
 
   case "${1:-help}" in
     install)
