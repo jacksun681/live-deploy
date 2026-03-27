@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export DEBIAN_FRONTEND=noninteractive
+
 REAL_PATH="/usr/local/bin/live_menu.real"
 MENU_PATH="/usr/local/bin/menu"
 COMPAT_PATH="/usr/local/bin/live_menu"
@@ -15,8 +17,11 @@ URLS=(
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
-    apt update -y
-    apt install -y "$2"
+    apt-get update -yq
+    apt-get install -yq \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confold" \
+      "$2"
   }
 }
 
@@ -160,6 +165,14 @@ self_fix() {
   [[ -f "$LOCAL_INSTALLER" ]] && normalize_file "$LOCAL_INSTALLER"
 }
 
+first_bootstrap() {
+  if [[ -x "$REAL_PATH" ]]; then
+    echo
+    echo "[初始化] 正在自动初始化并输出链接..."
+    bash "$REAL_PATH" --bootstrap || true
+  fi
+}
+
 main() {
   self_fix
   precheck
@@ -169,7 +182,8 @@ main() {
     install)
       download_main
       create_wrapper
-      echo "[完成] 现在可直接运行: menu"
+      echo "[完成] 已安装菜单命令: menu"
+      first_bootstrap
       ;;
     rollback)
       rollback_main
