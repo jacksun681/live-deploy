@@ -6,15 +6,12 @@ export DEBIAN_FRONTEND=noninteractive
 CONF="/usr/local/etc/xray/config.json"
 ETC_CONF="/etc/xray/config.json"
 SYSCTL_CONF="/etc/sysctl.d/99-cast.conf"
+DOCTOR_REAL="/usr/local/bin/cast_doctor.real"
 
 DOMAIN="www.cloudflare.com"
 PORT="443"
 FLOW="xtls-rprx-vision"
 MAIN_USER="stream-main"
-
-# 诊断目标：可按你的线路实际情况改
-HK_TEST_TARGET="1.1.1.1"
-GLOBAL_TEST_TARGET="8.8.8.8"
 
 [[ "$(id -u)" -ne 0 ]] && echo "请用 root 运行" && exit 1
 
@@ -36,7 +33,6 @@ install_deps() {
   need_cmd ping iputils-ping
   need_cmd ip iproute2
   need_cmd bc bc
-  need_cmd awk gawk
 }
 
 install_xray() {
@@ -320,6 +316,8 @@ ensure_base_config() {
   install_deps
   install_xray
 
+  local need_restart=0
+
   if [[ ! -f "$CONF" ]]; then
     local algo keys pri uuid shortids_json
     algo="$(choose_tcp_algo)"
@@ -334,7 +332,7 @@ ensure_base_config() {
   fi
 
   if repair_config; then
-    :
+    need_restart=1
   else
     rc=$?
     if [[ "$rc" -eq 2 || "$rc" -eq 3 ]]; then
@@ -353,7 +351,10 @@ ensure_base_config() {
   fi
 
   ensure_conf_link
-  systemctl restart xray
+
+  if [[ "$need_restart" -eq 1 ]]; then
+    systemctl restart xray
+  fi
 }
 
 get_private_key() {
@@ -449,7 +450,7 @@ PY
 print_main_link() {
   ensure_base_config
   ensure_main_user
-  local line idx name uuid flow
+  local idx name uuid flow
   while IFS='|' read -r idx name uuid flow; do
     [[ "$name" != "$MAIN_USER" ]] && continue
     build_link "$uuid" "$name" "$flow"
@@ -602,10 +603,6 @@ PY
   echo
 }
 
-show_status() {
-  systemctl status xray --no-pager -l
-}
-
 show_summary() {
   ensure_base_config
   local ip users sid_count
@@ -626,211 +623,14 @@ PY
   echo "服务状态: $(systemctl is-active xray 2>/dev/null || true)"
 }
 
-probe_target() {
-  local target="$1"
-  local count="${2:-6}"
-  local interval="${3:-5}"
-  local label="$4"
-
-  local out_file
-  out_file="$(mktemp)"
-  local ok=0 fail=0
-
-  for _ in $(seq 1 "$count"); do
-    local line
-    line="$(ping -c 1 -W 2 "$target" 2>/dev/null | awk -F'time=' '/time=/{print $2}' | awk '{print $1}' || true)"
-    if [[ -n "$line" ]]; then
-      echo "$line" >> "$out_file"
-      ok=$((ok+1))
-    else
-      fail=$((fail+1))
-    fi
-    sleep "$interval"
-  done
-
-  local stats
-  stats="$(python3 - "$out_file" "$ok" "$fail" "$label" <<'PY'
-import sys, statistics
-path, ok, fail, label = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
-vals=[]
-with open(path,"r",encoding="utf-8") as f:
-    for line in f:
-        line=line.strip()
-        if line:
-            vals.append(float(line))
-loss = 0.0
-total = ok + fail
-if total > 0:
-    loss = fail * 100.0 / total
-if vals:
-    avg = sum(vals)/len(vals)
-    mn = min(vals)
-    mx = max(vals)
-    jitter = statistics.pstdev(vals) if len(vals) > 1 else 0.0
-    print(f"{label}|{avg:.1f}|{mn:.1f}|{mx:.1f}|{loss:.1f}|{jitter:.1f}")
-else:
-    print(f"{label}|0.0|0.0|0.0|100.0|0.0")
-PY
-)"
-  rm -f "$out_file"
-  echo "$stats"
+run_doctor_menu() {
+  [[ -x "$DOCTOR_REAL" ]] || { echo "诊断工具不存在"; return 1; }
+  bash "$DOCTOR_REAL" doctor
 }
 
-diagnose_conclusion() {
-  local xray_ok="$1" port_ok="$2" cpu="$3" mem="$4" hk_loss="$5" hk_jit="$6" gl_loss="$7" gl_jit="$8"
-
-  if [[ "$xray_ok" != "running" || "$port_ok" != "yes" ]]; then
-    echo "结论: 节点服务异常"
-    echo "推测: 当前问题主要来自服务器侧"
-    return
-  fi
-
-  if (( cpu >= 90 )) || (( mem >= 90 )); then
-    echo "结论: 系统资源异常"
-    echo "推测: 当前卡顿更像服务器负载过高"
-    return
-  fi
-
-  if (( $(echo "$hk_loss >= 5 || $hk_jit >= 20" | bc -l) )); then
-    echo "结论: 接入段波动明显"
-    echo "推测: 更像前段到节点链路不稳"
-    return
-  fi
-
-  if (( $(echo "$gl_loss >= 5 || $gl_jit >= 25" | bc -l) )); then
-    echo "结论: 出口段波动明显"
-    echo "推测: 更像节点到目标平台方向不稳"
-    return
-  fi
-
-  echo "结论: 节点侧整体正常"
-  echo "推测: 更像本地推流端、OBS编码或平台侧波动"
-}
-
-doctor() {
-  ensure_base_config
-  clear
-  echo "=============================="
-  echo "        CAST DOCTOR"
-  echo "=============================="
-  echo
-  echo "[1] 服务状态"
-
-  local xray_state port_ok cfg_ok
-  xray_state="$(systemctl is-active xray 2>/dev/null || true)"
-  if ss -lntp 2>/dev/null | grep -q ":${PORT} "; then
-    port_ok="yes"
-  else
-    port_ok="no"
-  fi
-
-  if jq -e '.inbounds[0].streamSettings.realitySettings.privateKey and .inbounds[0].settings.clients' "$CONF" >/dev/null 2>&1; then
-    cfg_ok="正常"
-  else
-    cfg_ok="异常"
-  fi
-
-  echo "Xray: $xray_state"
-  echo "监听端口: $PORT ($port_ok)"
-  echo "配置完整: $cfg_ok"
-  echo "主用户: $MAIN_USER"
-  echo
-
-  echo "[2] 系统状态"
-  local cpu mem load disk conn_count
-  cpu="$(top -bn1 | awk -F'id,' '/Cpu\(s\)/{gsub(/ /,"",$1); split($1,a,","); split(a[length(a)],b,"."); print 100-b[1] }' | head -n1)"
-  [[ -z "${cpu:-}" ]] && cpu=0
-  mem="$(free | awk '/Mem:/{printf("%d", $3*100/$2)}')"
-  load="$(awk '{print $1" "$2" "$3}' /proc/loadavg)"
-  disk="$(df -h / | awk 'NR==2{print $5}')"
-  conn_count="$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l | awk '{print $1}')"
-
-  echo "CPU: ${cpu}%"
-  echo "内存: ${mem}%"
-  echo "负载: $load"
-  echo "磁盘: $disk"
-  echo "当前连接数: $conn_count"
-  echo
-
-  echo "[3] 链路采样（约60秒）"
-  local hk_stats gl_stats
-  hk_stats="$(probe_target "$HK_TEST_TARGET" 6 5 "香港链路")"
-  gl_stats="$(probe_target "$GLOBAL_TEST_TARGET" 6 5 "全球出口")"
-
-  IFS='|' read -r hk_label hk_avg hk_min hk_max hk_loss hk_jit <<< "$hk_stats"
-  IFS='|' read -r gl_label gl_avg gl_min gl_max gl_loss gl_jit <<< "$gl_stats"
-
-  echo "${hk_label}:"
-  echo "  平均延迟: ${hk_avg} ms"
-  echo "  最大延迟: ${hk_max} ms"
-  echo "  丢包: ${hk_loss}%"
-  echo "  抖动: ${hk_jit} ms"
-  echo
-  echo "${gl_label}:"
-  echo "  平均延迟: ${gl_avg} ms"
-  echo "  最大延迟: ${gl_max} ms"
-  echo "  丢包: ${gl_loss}%"
-  echo "  抖动: ${gl_jit} ms"
-  echo
-
-  echo "[4] 诊断结论"
-  diagnose_conclusion "$xray_state" "$port_ok" "$cpu" "$mem" "$hk_loss" "$hk_jit" "$gl_loss" "$gl_jit"
-  echo
-}
-
-watch_once() {
-  local xray_state cpu mem conn_count hk_stats gl_stats hk_avg hk_loss hk_jit gl_avg gl_loss gl_jit
-  xray_state="$(systemctl is-active xray 2>/dev/null || true)"
-  cpu="$(top -bn1 | awk -F'id,' '/Cpu\(s\)/{gsub(/ /,"",$1); split($1,a,","); split(a[length(a)],b,"."); print 100-b[1] }' | head -n1)"
-  [[ -z "${cpu:-}" ]] && cpu=0
-  mem="$(free | awk '/Mem:/{printf("%d", $3*100/$2)}')"
-  conn_count="$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l | awk '{print $1}')"
-
-  hk_stats="$(probe_target "$HK_TEST_TARGET" 2 1 "香港")"
-  gl_stats="$(probe_target "$GLOBAL_TEST_TARGET" 2 1 "全球")"
-
-  IFS='|' read -r _ hk_avg _ _ hk_loss hk_jit <<< "$hk_stats"
-  IFS='|' read -r _ gl_avg _ _ gl_loss gl_jit <<< "$gl_stats"
-
-  local verdict
-  if [[ "$xray_state" != "running" ]]; then
-    verdict="服务异常"
-  elif (( $(echo "$hk_loss >= 5 || $hk_jit >= 20" | bc -l) )); then
-    verdict="香港链路波动"
-  elif (( $(echo "$gl_loss >= 5 || $gl_jit >= 25" | bc -l) )); then
-    verdict="全球出口波动"
-  elif (( cpu >= 90 )) || (( mem >= 90 )); then
-    verdict="资源异常"
-  else
-    verdict="正常"
-  fi
-
-  clear
-  echo "=============================="
-  echo "         CAST WATCH"
-  echo "=============================="
-  echo
-  echo "时间: $(date '+%F %T')"
-  echo
-  echo "Xray: $xray_state"
-  echo "CPU: ${cpu}%"
-  echo "内存: ${mem}%"
-  echo "连接数: $conn_count"
-  echo
-  echo "香港: ${hk_avg}ms / loss ${hk_loss}% / jitter ${hk_jit}ms"
-  echo "全球: ${gl_avg}ms / loss ${gl_loss}% / jitter ${gl_jit}ms"
-  echo
-  echo "状态: $verdict"
-  echo
-  echo "按 Ctrl + C 退出"
-}
-
-watch_loop() {
-  ensure_base_config
-  while true; do
-    watch_once
-    sleep 5
-  done
+run_watch() {
+  [[ -x "$DOCTOR_REAL" ]] || { echo "诊断工具不存在"; return 1; }
+  bash "$DOCTOR_REAL" watch
 }
 
 menu_ui() {
@@ -861,8 +661,8 @@ EOF
     5) delete_user ;;
     6) reset_user ;;
     7) show_summary ;;
-    8) doctor ;;
-    9) watch_loop ;;
+    8) run_doctor_menu ;;
+    9) run_watch ;;
     0) exit 0 ;;
     *) echo "无效选项" ;;
   esac
@@ -873,14 +673,6 @@ case "${1:-}" in
     ensure_base_config
     ensure_main_user
     print_first_bootstrap
-    exit 0
-    ;;
-  doctor)
-    doctor
-    exit 0
-    ;;
-  watch)
-    watch_loop
     exit 0
     ;;
 esac
