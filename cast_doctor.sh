@@ -517,56 +517,41 @@ live_sim_diag() {
   awk "BEGIN{exit !($mem_max > 90)}" && perf_score=$((perf_score+3))
   [[ "$high_mem" -ge 2 ]] && perf_score=$((perf_score+3))
 
+  # 链路判断：优先看延迟和抖动，loss只做辅因子
   awk "BEGIN{exit !($avg_hk > 120)}" && line_score=$((line_score+2))
-  awk "BEGIN{exit !($hk_max > 200)}" && line_score=$((line_score+3))
-  [[ "$high_hk" -ge 2 ]] && line_score=$((line_score+3))
-  awk "BEGIN{exit !($avg_hk_loss >= 3)}" && line_score=$((line_score+2))
-  [[ "$high_hk_loss" -ge 2 ]] && line_score=$((line_score+4))
-  awk "BEGIN{exit !($avg_hk_jitter > 50)}" && line_score=$((line_score+3))
+  awk "BEGIN{exit !($hk_max > 200)}" && line_score=$((line_score+2))
+  awk "BEGIN{exit !($avg_hk_jitter > 40)}" && line_score=$((line_score+3))
+  [[ "$high_hk" -ge 2 ]] && line_score=$((line_score+2))
+
+  # 只有当延迟/抖动也偏高时，loss才加分
+  if (( $(echo "$avg_hk > 80 || $avg_hk_jitter > 30" | bc -l) )); then
+    awk "BEGIN{exit !($avg_hk_loss >= 20)}" && line_score=$((line_score+2))
+    [[ "$high_hk_loss" -ge 2 ]] && line_score=$((line_score+2))
+  fi
 
   awk "BEGIN{exit !($avg_gl > 180)}" && exit_score=$((exit_score+2))
-  awk "BEGIN{exit !($gl_max > 250)}" && exit_score=$((exit_score+3))
-  [[ "$high_gl" -ge 2 ]] && exit_score=$((exit_score+3))
-  awk "BEGIN{exit !($avg_gl_loss >= 3)}" && exit_score=$((exit_score+2))
-  [[ "$high_gl_loss" -ge 2 ]] && exit_score=$((exit_score+4))
-  awk "BEGIN{exit !($avg_gl_jitter > 60)}" && exit_score=$((exit_score+3))
+  awk "BEGIN{exit !($gl_max > 250)}" && exit_score=$((exit_score+2))
+  awk "BEGIN{exit !($avg_gl_jitter > 50)}" && exit_score=$((exit_score+3))
+  [[ "$high_gl" -ge 2 ]] && exit_score=$((exit_score+2))
+
+  if (( $(echo "$avg_gl > 150 || $avg_gl_jitter > 35" | bc -l) )); then
+    awk "BEGIN{exit !($avg_gl_loss >= 20)}" && exit_score=$((exit_score+2))
+    [[ "$high_gl_loss" -ge 2 ]] && exit_score=$((exit_score+2))
+  fi
 
   [[ "$dns_fail" -ge 1 ]] && exit_score=$((exit_score+2))
-  [[ "$http_fail" -ge 1 ]] && exit_score=$((exit_score+2))
+  [[ "$http_fail" -ge 1 ]] && exit_score=$((exit_score+3))
 
   if [[ "$perf_score" -eq 0 && "$line_score" -eq 0 && "$exit_score" -eq 0 ]]; then
     platform_score=$((platform_score+5))
   fi
 
-  echo "--------------------------------------"
-  say "综合评分"
-  echo "性能问题分数     : ${perf_score}"
-  echo "链路问题分数     : ${line_score}"
-  echo "出口问题分数     : ${exit_score}"
-  echo "平台/编码分数    : ${platform_score}"
-  echo "--------------------------------------"
+  say "综合结论"
+  echo "最可能原因      : ${top_reason:-未识别}"
+  [[ -n "${second_reason:-}" ]] && echo "次可能原因      : ${second_reason}"
+  echo
 
-  local max_score=0
-  local top_reason=""
-  local second_score=0
-  local second_reason=""
-
-  for item in "性能问题:${perf_score}" "链路问题:${line_score}" "出口问题:${exit_score}" "平台/编码问题:${platform_score}"; do
-    local name score
-    name="${item%%:*}"
-    score="${item##*:}"
-
-    if [[ "$score" -gt "$max_score" ]]; then
-      second_score="$max_score"
-      second_reason="$top_reason"
-      max_score="$score"
-      top_reason="$name"
-    elif [[ "$score" -gt "$second_score" ]]; then
-      second_score="$score"
-      second_reason="$name"
-    fi
-  done
-
+  say "判断依据"
   say "综合结论"
   echo "最可能原因      : ${top_reason:-未识别}"
   [[ -n "${second_reason:-}" ]] && echo "次可能原因      : ${second_reason}"
@@ -575,23 +560,23 @@ live_sim_diag() {
   say "判断依据"
   case "$top_reason" in
     "性能问题")
-      echo "- CPU/内存平均值或峰值偏高"
+      echo "- CPU 或内存平均值、峰值偏高"
       echo "- 更像是推流编码、进程负载或机器资源不足"
       ;;
     "链路问题")
-      echo "- 香港方向 TCP 延迟、丢包、抖动异常"
-      echo "- 更像是前段链路波动"
+      echo "- 香港方向延迟或抖动偏高"
+      echo "- 更像是前段链路质量波动"
       ;;
     "出口问题")
-      echo "- 全球方向 TCP 延迟、丢包、抖动异常"
-      echo "- 更像是出口到目标平台方向不稳"
+      echo "- 全球方向延迟、抖动或 HTTPS 出口异常"
+      echo "- 更像是节点到目标平台方向不稳"
       ;;
     "平台/编码问题")
       echo "- 机器、链路、出口整体正常"
-      echo "- 更像是平台侧波动、直播码率、分辨率或编码参数问题"
+      echo "- 更像是平台侧波动、码率、分辨率或编码参数问题"
       ;;
     *)
-      echo "- 未形成明确主因，建议结合日志继续观察"
+      echo "- 当前未形成明确主因，建议结合日志继续观察"
       ;;
   esac
   echo
@@ -625,12 +610,11 @@ live_sim_diag() {
 watch_once() {
   local xray_state cpu mem conn_count https_ok
   local hk_stats gl_stats hk_avg hk_loss hk_jit gl_avg gl_loss gl_jit
-  local verdict detail
+  local verdict detail level
 
   xray_state="$(systemctl is-active xray 2>/dev/null || true)"
   cpu="$(cpu_usage)"
   mem="$(mem_usage)"
-
   conn_count="$(ss -ant 2>/dev/null | awk '/:443 / || /:443$/ {c++} END{print c+0}')"
 
   if curl -I -s --max-time 5 https://www.cloudflare.com >/dev/null 2>&1; then
@@ -639,28 +623,48 @@ watch_once() {
     https_ok="FAIL"
   fi
 
-  # TCP检测保留做参考，不再直接作为唯一判定依据
   hk_stats="$(tcp_probe "$HK_TEST_TARGET" 443 2 1 "香港")"
   gl_stats="$(tcp_probe "$GLOBAL_TEST_TARGET" 443 2 1 "全球")"
 
   IFS='|' read -r _ hk_avg _ hk_loss hk_jit <<< "$hk_stats"
   IFS='|' read -r _ gl_avg _ gl_loss gl_jit <<< "$gl_stats"
 
+  level="稳定"
+  verdict="直播正常"
+  detail="链路活跃"
+
   if [[ "$xray_state" != "active" ]]; then
+    level="异常"
     verdict="服务异常"
     detail="Xray 未运行"
   elif [[ "$https_ok" != "OK" ]]; then
+    level="异常"
     verdict="出口异常"
     detail="HTTPS 不通"
   elif (( $(echo "$cpu >= 90 || $mem >= 90" | bc -l) )); then
+    level="风险"
     verdict="资源异常"
     detail="CPU 或内存过高"
-  elif [[ "$conn_count" -ge 1 ]]; then
-    verdict="直播正常"
-    detail="链路活跃"
+  elif (( conn_count < 1 )); then
+    if (( $(echo "$hk_avg > 0 && $hk_avg < 80 && $gl_avg > 0 && $gl_avg < 150 && $hk_jit < 30 && $gl_jit < 40" | bc -l) )); then
+      level="稳定"
+      verdict="空闲"
+      detail="未检测到明显推流连接"
+    else
+      level="轻微波动"
+      verdict="空闲"
+      detail="当前无推流，链路参考值有波动"
+    fi
   else
-    verdict="空闲"
-    detail="未检测到明显推流连接"
+    if (( $(echo "$hk_avg > 150 || $gl_avg > 220 || $hk_jit > 50 || $gl_jit > 70" | bc -l) )); then
+      level="风险"
+      verdict="直播正常"
+      detail="链路活跃，但延迟或抖动偏高"
+    elif (( $(echo "$hk_avg > 80 || $gl_avg > 150 || $hk_jit > 25 || $gl_jit > 35" | bc -l) )); then
+      level="轻微波动"
+      verdict="直播正常"
+      detail="链路活跃，存在轻微波动"
+    fi
   fi
 
   clear
@@ -679,6 +683,7 @@ watch_once() {
   echo "香港TCP: ${hk_avg}ms / loss ${hk_loss}% / jitter ${hk_jit}ms"
   echo "全球TCP: ${gl_avg}ms / loss ${gl_loss}% / jitter ${gl_jit}ms"
   echo
+  echo "等级: $level"
   echo "状态: $verdict"
   echo "说明: $detail"
   echo
