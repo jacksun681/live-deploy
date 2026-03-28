@@ -593,15 +593,19 @@ PY
   return 0
 }
 
-run_doctor_menu() {
+run_watch() {
   [[ -x "$DOCTOR_REAL" ]] || { echo "诊断工具不存在"; return 1; }
-  bash "$DOCTOR_REAL" doctor || { echo; echo "诊断执行失败"; return 1; }
+  bash "$DOCTOR_REAL" watch
+  local rc=$?
+  [[ "$rc" -eq 99 ]] && exit 0
   return 0
 }
 
-run_watch() {
+run_doctor_menu() {
   [[ -x "$DOCTOR_REAL" ]] || { echo "诊断工具不存在"; return 1; }
-  bash "$DOCTOR_REAL" watch || { echo; echo "实时监控执行失败"; return 1; }
+  bash "$DOCTOR_REAL" doctor
+  local rc=$?
+  [[ "$rc" -eq 99 ]] && exit 0
   return 0
 }
 
@@ -618,8 +622,8 @@ menu_ui() {
 5. 删除用户
 6. 重置用户
 7. 节点状态
-8. 诊断菜单
-9. 实时监控
+8. 实时监控
+9. 诊断菜单
 0. 退出
 ==============================
 EOF
@@ -633,8 +637,8 @@ EOF
     5) delete_user ;;
     6) reset_user ;;
     7) show_summary ;;
-    8) run_doctor_menu || true ;;
-    9) run_watch || true ;;
+    8) run_watch ;;
+    9) run_doctor_menu ;;
     0) exit 0 ;;
     *) echo "无效选项" ;;
   esac
