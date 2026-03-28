@@ -350,30 +350,32 @@ watch_loop() {
   install_deps
   check_runtime_ready || true
 
-  local stop_flag=0 quit_flag=0 key=""
+  local stop_flag=0
   trap 'stop_flag=1' INT
 
   while true; do
     [[ "$stop_flag" -eq 1 ]] && break
+
     watch_once
-    key=""
-    if read -r -t 5 key 2>/dev/null; then
-      case "$key" in
-        q|Q) quit_flag=1; break ;;
-      esac
-    fi
+
+    echo
+    read -r -t 5 -p "输入 q 回车退出，或等待自动刷新: " key || key=""
+
+    case "$key" in
+      q|Q)
+        trap - INT
+        echo
+        echo "已结束监控，退出到命令行。"
+        return 99
+        ;;
+    esac
   done
 
   trap - INT
   echo
-  if [[ "$quit_flag" -eq 1 ]]; then
-    echo "已结束监控，退出到命令行。"
-    return 99
-  else
-    echo "已结束监控，返回菜单..."
-    sleep 1
-    return 0
-  fi
+  echo "已结束监控，返回菜单..."
+  sleep 1
+  return 0
 }
 
 show_recent_logs() {
