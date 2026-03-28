@@ -173,39 +173,78 @@ judge_watch_status() {
   echo "$level|$verdict|$detail"
 }
 
+judge_diag_status() {
+  local cpu="$1" mem="$2" dns="$3" http="$4" a_avg="$5" a_loss="$6" a_jit="$7" b_avg="$8" b_loss="$9" b_jit="${10}"
+
+  local level="稳定"
+  local verdict="适合直播"
+  local detail="资源与链路状态正常"
+
+  if [[ "$dns" != "ok" || "$http" != "ok" ]]; then
+    level="异常"
+    verdict="出口异常"
+    detail="DNS 或 HTTPS 出口不通"
+  elif (( $(echo "$cpu >= 90 || $mem >= 90" | bc -l) )); then
+    level="风险"
+    verdict="资源异常"
+    detail="CPU 或内存占用过高"
+  elif (( $(echo "$a_loss >= 20 || $b_loss >= 20" | bc -l) )); then
+    level="风险"
+    verdict="链路不稳"
+    detail="丢包偏高"
+  elif (( $(echo "$a_avg > 150 || $b_avg > 220 || $a_jit > 50 || $b_jit > 70" | bc -l) )); then
+    level="风险"
+    verdict="链路波动较大"
+    detail="延迟或抖动偏高"
+  elif (( $(echo "$a_avg > 80 || $b_avg > 150 || $a_jit > 25 || $b_jit > 35" | bc -l) )); then
+    level="轻微波动"
+    verdict="基本可用"
+    detail="链路有轻微波动"
+  fi
+
+  echo "$level|$verdict|$detail"
+}
+
 safe_inspect() {
   local logfile="${LOG_DIR}/safe_$(date +%F_%H%M%S).log"
+  local cpu mem probes dns http a_line b_line a_avg a_loss a_jit b_avg b_loss b_jit result level verdict detail
+
+  cpu="$(cpu_usage)"
+  mem="$(mem_usage)"
+  probes="$(probe_pair 3)"
+  dns="$(dns_check)"
+  http="$(http_check)"
+  a_line="$(echo "$probes" | sed -n '1p')"
+  b_line="$(echo "$probes" | sed -n '2p')"
+  IFS='|' read -r _ a_avg a_loss a_jit <<< "$a_line"
+  IFS='|' read -r _ b_avg b_loss b_jit <<< "$b_line"
+  result="$(judge_diag_status "$cpu" "$mem" "$dns" "$http" "$a_avg" "$a_loss" "$a_jit" "$b_avg" "$b_loss" "$b_jit")"
+  IFS='|' read -r level verdict detail <<< "$result"
 
   {
     echo "======================================"
-    echo "          CAST 专业诊断工具"
+    echo "          CAST 安全巡检"
     echo "======================================"
     echo
     echo "主机名      : $(hostname)"
     echo "系统时间    : $(date)"
-    echo "内核版本    : $(uname -r)"
-    echo "出口网卡    : $(get_iface)"
     echo "Xray状态    : $(systemctl is-active xray 2>/dev/null || true)"
-    echo "443监听     : $(ss -lntp 2>/dev/null | grep -q ":${PORT} " && echo yes || echo no)"
-    echo
-    echo "CPU占用     : $(cpu_usage)%"
-    echo "内存占用    : $(mem_usage)%"
+    echo "CPU占用     : ${cpu}%"
+    echo "内存占用    : ${mem}%"
     echo "磁盘占用    : $(disk_usage)%"
     echo "1分钟负载   : $(load1)"
     echo "443连接数   : $(conn_443_count)"
     echo
-    local probes dns http
-    probes="$(probe_pair 3)"
-    dns="$(dns_check)"
-    http="$(http_check)"
     print_probe_lines "$probes"
     echo "DNS状态    : ${dns}"
     echo "HTTPS出口  : ${http}"
     echo
+    echo "等级       : ${level}"
+    echo "结论       : ${verdict}"
+    echo "说明       : ${detail}"
+    echo
   } | tee "$logfile"
 
-  echo "安全巡检完成，日志: $logfile"
-  echo
   return 0
 }
 
@@ -221,6 +260,7 @@ light_monitor() {
   local count=$((duration / interval))
   [[ "$count" -lt 1 ]] && count=1
 
+  local last_avg=0 last_loss=0 last_jit=0
   for ((i=1; i<=count; i++)); do
     local now cpu mem load rx tx stats avg loss jit label
     now="$(date '+%F %T')"
@@ -232,17 +272,42 @@ light_monitor() {
     stats="$(ping_probe "$target" 3 "监控")"
     IFS='|' read -r label avg loss jit <<< "$stats"
     echo "${now},${cpu},${mem},${load},${rx},${tx},${avg},${loss},${jit}" | tee -a "$logfile"
+    last_avg="$avg"; last_loss="$loss"; last_jit="$jit"
     sleep "$interval"
   done
 
+  local cpu mem dns http result level verdict detail
+  cpu="$(cpu_usage)"
+  mem="$(mem_usage)"
+  dns="$(dns_check)"
+  http="$(http_check)"
+  result="$(judge_diag_status "$cpu" "$mem" "$dns" "$http" "$last_avg" "$last_loss" "$last_jit" "$last_avg" "$last_loss" "$last_jit")"
+  IFS='|' read -r level verdict detail <<< "$result"
+
   echo
-  echo "轻量监控完成，日志: $logfile"
+  echo "等级       : ${level}"
+  echo "结论       : ${verdict}"
+  echo "说明       : ${detail}"
+  echo "日志       : ${logfile}"
   echo
   return 0
 }
 
 deep_diag() {
   local logfile="${LOG_DIR}/deep_$(date +%F_%H%M%S).log"
+  local cpu mem probes dns http a_line b_line a_avg a_loss a_jit b_avg b_loss b_jit result level verdict detail
+
+  cpu="$(cpu_usage)"
+  mem="$(mem_usage)"
+  probes="$(probe_pair 5)"
+  dns="$(dns_check)"
+  http="$(http_check)"
+  a_line="$(echo "$probes" | sed -n '1p')"
+  b_line="$(echo "$probes" | sed -n '2p')"
+  IFS='|' read -r _ a_avg a_loss a_jit <<< "$a_line"
+  IFS='|' read -r _ b_avg b_loss b_jit <<< "$b_line"
+  result="$(judge_diag_status "$cpu" "$mem" "$dns" "$http" "$a_avg" "$a_loss" "$a_jit" "$b_avg" "$b_loss" "$b_jit")"
+  IFS='|' read -r level verdict detail <<< "$result"
 
   {
     echo "======================================"
@@ -252,23 +317,21 @@ deep_diag() {
     echo "主机名      : $(hostname)"
     echo "系统时间    : $(date)"
     echo "Xray状态    : $(systemctl is-active xray 2>/dev/null || true)"
-    echo "CPU占用     : $(cpu_usage)%"
-    echo "内存占用    : $(mem_usage)%"
+    echo "CPU占用     : ${cpu}%"
+    echo "内存占用    : ${mem}%"
     echo
-    local probes dns http
-    probes="$(probe_pair 5)"
-    dns="$(dns_check)"
-    http="$(http_check)"
     print_probe_lines "$probes"
     echo "DNS       -> ${dns}"
     echo "HTTPS出口 -> ${http}"
     echo
     traceroute -m 8 8.8.8.8 || true
     echo
+    echo "等级       : ${level}"
+    echo "结论       : ${verdict}"
+    echo "说明       : ${detail}"
+    echo
   } | tee "$logfile"
 
-  echo "深度诊断完成，日志: $logfile"
-  echo
   return 0
 }
 
@@ -283,6 +346,10 @@ live_sim_diag() {
 
   local count=$((duration / interval))
   [[ "$count" -lt 1 ]] && count=1
+
+  local last_cpu=0 last_mem=0 last_dns=ok last_http=ok
+  local last_a_avg=0 last_a_loss=100 last_a_jit=0
+  local last_b_avg=0 last_b_loss=100 last_b_jit=0
 
   for ((i=1; i<=count; i++)); do
     local now cpu mem load rx tx dns http probes a_line b_line a_avg a_loss a_jit b_avg b_loss b_jit
@@ -301,11 +368,23 @@ live_sim_diag() {
     IFS='|' read -r _ b_avg b_loss b_jit <<< "$b_line"
 
     echo "${now},${cpu},${mem},${load},${rx},${tx},${a_avg},${a_loss},${a_jit},${b_avg},${b_loss},${b_jit},${dns},${http}" | tee -a "$logfile"
+
+    last_cpu="$cpu"; last_mem="$mem"; last_dns="$dns"; last_http="$http"
+    last_a_avg="$a_avg"; last_a_loss="$a_loss"; last_a_jit="$a_jit"
+    last_b_avg="$b_avg"; last_b_loss="$b_loss"; last_b_jit="$b_jit"
+
     sleep "$interval"
   done
 
+  local result level verdict detail
+  result="$(judge_diag_status "$last_cpu" "$last_mem" "$last_dns" "$last_http" "$last_a_avg" "$last_a_loss" "$last_a_jit" "$last_b_avg" "$last_b_loss" "$last_b_jit")"
+  IFS='|' read -r level verdict detail <<< "$result"
+
   echo
-  echo "综合诊断完成，日志: $logfile"
+  echo "等级       : ${level}"
+  echo "结论       : ${verdict}"
+  echo "说明       : ${detail}"
+  echo "日志       : ${logfile}"
   echo
   return 0
 }
@@ -342,7 +421,7 @@ watch_once() {
   echo "结论: $verdict"
   echo "说明: $detail"
   echo
-  echo "Ctrl+C 返回菜单，输入 q 后回车退出到命令行"
+  echo "q 回车返回管理菜单，Ctrl+C 退出到命令行"
   return 0
 }
 
@@ -359,23 +438,22 @@ watch_loop() {
     watch_once
 
     echo
-    read -r -t 5 -p "输入 q 回车退出，或等待自动刷新: " key || key=""
+    read -r -t 5 -p "输入 q 回车返回管理菜单，或等待自动刷新: " key || key=""
 
     case "$key" in
       q|Q)
         trap - INT
         echo
-        echo "已结束监控，退出到命令行。"
-        return 99
+        echo "已结束监控，返回管理菜单。"
+        return 0
         ;;
     esac
   done
 
   trap - INT
   echo
-  echo "已结束监控，返回菜单..."
-  sleep 1
-  return 0
+  echo "已结束监控，退出到命令行。"
+  return 99
 }
 
 show_recent_logs() {
@@ -419,6 +497,7 @@ EOF
       0) return 0 ;;
       *) echo "无效选择" ;;
     esac
+
     echo
     read -rp "按回车返回诊断菜单..." _
   done
