@@ -1,4 +1,3 @@
-cat > /root/cast_doctor.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -10,17 +9,6 @@ PROBE_B_TARGET="1.1.1.1"
 BASE_DIR="/root/cast_data"
 LOG_DIR="${BASE_DIR}/logs"
 mkdir -p "$LOG_DIR"
-
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-BLUE="\033[36m"
-NC="\033[0m"
-
-say()  { echo -e "${BLUE}[$(date '+%F %T')]${NC} $*"; }
-ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-err()  { echo -e "${RED}[ERR]${NC} $*"; }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -43,11 +31,12 @@ install_deps() {
   need_cmd top procps
   need_cmd dig dnsutils
   need_cmd traceroute traceroute
+  return 0
 }
 
 check_runtime_ready() {
-  [[ -f "$CONF" ]] || { err "配置文件不存在"; return 1; }
-  command -v xray >/dev/null 2>&1 || { err "xray 未安装"; return 1; }
+  [[ -f "$CONF" ]] || { echo "配置文件不存在"; return 1; }
+  command -v xray >/dev/null 2>&1 || { echo "xray 未安装"; return 1; }
   return 0
 }
 
@@ -135,44 +124,6 @@ stream_activity_text() {
   fi
 }
 
-show_header() {
-  echo
-  echo "======================================"
-  echo "          CAST 专业诊断工具"
-  echo "======================================"
-}
-
-show_basic_info() {
-  say "基础信息"
-  echo "主机名      : $(hostname)"
-  echo "系统时间    : $(date)"
-  echo "内核版本    : $(uname -r)"
-  echo "出口网卡    : $(get_iface)"
-  echo "Xray状态    : $(systemctl is-active xray 2>/dev/null || true)"
-  echo "443监听     : $(ss -lntp 2>/dev/null | grep -q ":${PORT} " && echo yes || echo no)"
-  echo
-}
-
-show_resources() {
-  say "系统资源"
-  echo "CPU占用     : $(cpu_usage)%"
-  echo "内存占用    : $(mem_usage)%"
-  echo "磁盘占用    : $(disk_usage)%"
-  echo "1分钟负载   : $(load1)"
-  echo "443连接数   : $(conn_443_count)"
-  echo
-}
-
-show_network_base() {
-  say "网络基础状态"
-  echo "默认路由:"
-  ip route | sed 's/^/  /'
-  echo
-  echo "监听端口:"
-  ss -tuln | sed 's/^/  /'
-  echo
-}
-
 runtime_snapshot() {
   local iface conn rx tx activity
   iface="$(get_iface)"
@@ -224,13 +175,26 @@ judge_watch_status() {
 
 safe_inspect() {
   local logfile="${LOG_DIR}/safe_$(date +%F_%H%M%S).log"
-  {
-    show_header
-    show_basic_info
-    show_resources
 
-    say "低干扰网络检测"
-    local probes dns http cpu mem disk
+  {
+    echo "======================================"
+    echo "          CAST 专业诊断工具"
+    echo "======================================"
+    echo
+    echo "主机名      : $(hostname)"
+    echo "系统时间    : $(date)"
+    echo "内核版本    : $(uname -r)"
+    echo "出口网卡    : $(get_iface)"
+    echo "Xray状态    : $(systemctl is-active xray 2>/dev/null || true)"
+    echo "443监听     : $(ss -lntp 2>/dev/null | grep -q ":${PORT} " && echo yes || echo no)"
+    echo
+    echo "CPU占用     : $(cpu_usage)%"
+    echo "内存占用    : $(mem_usage)%"
+    echo "磁盘占用    : $(disk_usage)%"
+    echo "1分钟负载   : $(load1)"
+    echo "443连接数   : $(conn_443_count)"
+    echo
+    local probes dns http
     probes="$(probe_pair 3)"
     dns="$(dns_check)"
     http="$(http_check)"
@@ -238,24 +202,11 @@ safe_inspect() {
     echo "DNS状态    : ${dns}"
     echo "HTTPS出口  : ${http}"
     echo
-
-    say "自动判断"
-    cpu="$(cpu_usage)"
-    mem="$(mem_usage)"
-    disk="$(disk_usage)"
-
-    [[ "$disk" -ge 90 ]] 2>/dev/null && warn "磁盘占用偏高"
-    awk "BEGIN{exit !($cpu > 85)}" && err "更像是本机 CPU 压力过高"
-    awk "BEGIN{exit !($mem > 90)}" && err "更像是本机内存压力过高"
-    [[ "$dns" != "ok" ]] && err "更像是 DNS 解析异常"
-    [[ "$http" != "ok" ]] && err "HTTPS 出口访问异常"
-
-    echo
-    show_network_base
   } | tee "$logfile"
 
-  ok "安全巡检完成，日志已保存: $logfile"
+  echo "安全巡检完成，日志: $logfile"
   echo
+  return 0
 }
 
 light_monitor() {
@@ -265,16 +216,10 @@ light_monitor() {
   logfile="${LOG_DIR}/monitor_${duration}s_$(date +%F_%H%M%S).csv"
 
   echo "time,cpu_usage,mem_usage,load1,rx_bytes,tx_bytes,ping_ms,loss_percent,jitter_ms" > "$logfile"
-
-  say "开始轻量监控 ${duration} 秒，每 ${interval} 秒采样一次"
-  say "这是低干扰模式，不会改网络，也不会断网"
-  say "日志文件: $logfile"
+  echo "开始轻量监控 ${duration} 秒，日志: $logfile"
 
   local count=$((duration / interval))
   [[ "$count" -lt 1 ]] && count=1
-
-  local high_ping=0 high_jitter=0 high_cpu=0 high_mem=0
-  local ping_sum=0 loss_sum=0 jitter_sum=0 samples=0
 
   for ((i=1; i<=count; i++)); do
     local now cpu mem load rx tx stats avg loss jit label
@@ -286,52 +231,30 @@ light_monitor() {
     tx="$(cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null || echo 0)"
     stats="$(ping_probe "$target" 3 "监控")"
     IFS='|' read -r label avg loss jit <<< "$stats"
-
     echo "${now},${cpu},${mem},${load},${rx},${tx},${avg},${loss},${jit}" | tee -a "$logfile"
-
-    ping_sum="$(awk -v a="$ping_sum" -v b="$avg" 'BEGIN{print a+b}')"
-    loss_sum="$(awk -v a="$loss_sum" -v b="$loss" 'BEGIN{print a+b}')"
-    jitter_sum="$(awk -v a="$jitter_sum" -v b="$jit" 'BEGIN{print a+b}')"
-    samples=$((samples+1))
-
-    awk "BEGIN{exit !($avg > 200)}" && high_ping=$((high_ping+1))
-    awk "BEGIN{exit !($jit > 80)}" && high_jitter=$((high_jitter+1))
-    awk "BEGIN{exit !($cpu > 85)}" && high_cpu=$((high_cpu+1))
-    awk "BEGIN{exit !($mem > 90)}" && high_mem=$((high_mem+1))
-
     sleep "$interval"
   done
 
   echo
-  say "监控总结"
-  echo "平均延迟      : $(awk -v a="$ping_sum" -v c="$samples" 'BEGIN{if(c>0) printf("%.1f",a/c); else print "0"}') ms"
-  echo "平均丢包      : $(awk -v a="$loss_sum" -v c="$samples" 'BEGIN{if(c>0) printf("%.1f",a/c); else print "0"}')%"
-  echo "平均抖动      : $(awk -v a="$jitter_sum" -v c="$samples" 'BEGIN{if(c>0) printf("%.1f",a/c); else print "0"}') ms"
-  echo "高延迟次数    : ${high_ping}"
-  echo "高抖动次数    : ${high_jitter}"
-  echo "高CPU次数     : ${high_cpu}"
-  echo "高内存次数    : ${high_mem}"
+  echo "轻量监控完成，日志: $logfile"
   echo
-
-  [[ "$high_ping" -ge 2 ]] && warn "更像是链路存在明显延迟波动"
-  [[ "$high_jitter" -ge 2 ]] && warn "更像是链路存在明显抖动"
-  [[ "$high_cpu" -ge 2 ]] && err "更像是 VPS CPU 性能瓶颈"
-  [[ "$high_mem" -ge 2 ]] && err "更像是 VPS 内存瓶颈"
-
-  ok "轻量监控完成，日志已保存: $logfile"
-  echo
+  return 0
 }
 
 deep_diag() {
   local logfile="${LOG_DIR}/deep_$(date +%F_%H%M%S).log"
-  {
-    show_header
-    say "深度诊断建议在下播后运行"
-    echo
-    show_basic_info
-    show_resources
 
-    say "详细网络检测"
+  {
+    echo "======================================"
+    echo "          CAST 深度诊断"
+    echo "======================================"
+    echo
+    echo "主机名      : $(hostname)"
+    echo "系统时间    : $(date)"
+    echo "Xray状态    : $(systemctl is-active xray 2>/dev/null || true)"
+    echo "CPU占用     : $(cpu_usage)%"
+    echo "内存占用    : $(mem_usage)%"
+    echo
     local probes dns http
     probes="$(probe_pair 5)"
     dns="$(dns_check)"
@@ -340,16 +263,13 @@ deep_diag() {
     echo "DNS       -> ${dns}"
     echo "HTTPS出口 -> ${http}"
     echo
-
-    say "路由跟踪（轻度）"
-    traceroute -m 8 8.8.8.8 || warn "traceroute 执行失败"
+    traceroute -m 8 8.8.8.8 || true
     echo
-
-    show_network_base
   } | tee "$logfile"
 
-  ok "深度诊断完成，日志已保存: $logfile"
+  echo "深度诊断完成，日志: $logfile"
   echo
+  return 0
 }
 
 live_sim_diag() {
@@ -358,18 +278,11 @@ live_sim_diag() {
   logfile="${LOG_DIR}/sim_${duration}s_$(date +%F_%H%M%S).csv"
 
   echo "time,cpu,mem,load1,rx,tx,a_ping,a_loss,a_jitter,b_ping,b_loss,b_jitter,dns,http" > "$logfile"
-
-  say "开始综合诊断（直播仿真）"
-  say "说明：低干扰连续采样，尽量接近直播时的持续状态"
-  say "持续时间: ${duration} 秒，每 ${interval} 秒采样一次"
-  say "不会改网络，不会断网，不会跑重压测速"
+  echo "开始综合诊断（直播仿真），日志: $logfile"
   echo
 
   local count=$((duration / interval))
   [[ "$count" -lt 1 ]] && count=1
-
-  local cpu_sum=0 mem_sum=0 a_sum=0 b_sum=0 a_jit_sum=0 b_jit_sum=0
-  local cpu_max=0 mem_max=0 high_cpu=0 high_mem=0 high_a=0 high_b=0 dns_fail=0 http_fail=0 samples=0
 
   for ((i=1; i<=count; i++)); do
     local now cpu mem load rx tx dns http probes a_line b_line a_avg a_loss a_jit b_avg b_loss b_jit
@@ -388,61 +301,13 @@ live_sim_diag() {
     IFS='|' read -r _ b_avg b_loss b_jit <<< "$b_line"
 
     echo "${now},${cpu},${mem},${load},${rx},${tx},${a_avg},${a_loss},${a_jit},${b_avg},${b_loss},${b_jit},${dns},${http}" | tee -a "$logfile"
-
-    cpu_sum="$(awk -v a="$cpu_sum" -v b="$cpu" 'BEGIN{print a+b}')"
-    mem_sum="$(awk -v a="$mem_sum" -v b="$mem" 'BEGIN{print a+b}')"
-    a_sum="$(awk -v a="$a_sum" -v b="$a_avg" 'BEGIN{print a+b}')"
-    b_sum="$(awk -v a="$b_sum" -v b="$b_avg" 'BEGIN{print a+b}')"
-    a_jit_sum="$(awk -v a="$a_jit_sum" -v b="$a_jit" 'BEGIN{print a+b}')"
-    b_jit_sum="$(awk -v a="$b_jit_sum" -v b="$b_jit" 'BEGIN{print a+b}')"
-    samples=$((samples+1))
-
-    awk "BEGIN{exit !($cpu > $cpu_max)}" && cpu_max="$cpu"
-    awk "BEGIN{exit !($mem > $mem_max)}" && mem_max="$mem"
-    awk "BEGIN{exit !($cpu > 85)}" && high_cpu=$((high_cpu+1))
-    awk "BEGIN{exit !($mem > 90)}" && high_mem=$((high_mem+1))
-    awk "BEGIN{exit !($a_avg > 200)}" && high_a=$((high_a+1))
-    awk "BEGIN{exit !($b_avg > 250)}" && high_b=$((high_b+1))
-    [[ "$dns" != "ok" ]] && dns_fail=$((dns_fail+1))
-    [[ "$http" != "ok" ]] && http_fail=$((http_fail+1))
-
     sleep "$interval"
   done
 
   echo
-  say "直播仿真统计结果"
-  echo "平均CPU         : $(awk -v a="$cpu_sum" -v c="$samples" 'BEGIN{if(c>0) printf("%.1f",a/c); else print "0"}')%"
-  echo "峰值CPU         : ${cpu_max}%"
-  echo "平均内存        : $(awk -v a="$mem_sum" -v c="$samples" 'BEGIN{if(c>0) printf("%.1f",a/c); else print "0"}')%"
-  echo "峰值内存        : ${mem_max}%"
-  echo "探针A平均延迟   : $(awk -v a="$a_sum" -v c="$samples" 'BEGIN{if(c>0) printf("%.1f",a/c); else print "0"}') ms"
-  echo "探针A平均抖动   : $(awk -v a="$a_jit_sum" -v c="$samples" 'BEGIN{if(c>0) printf("%.1f",a/c); else print "0"}') ms"
-  echo "探针B平均延迟   : $(awk -v a="$b_sum" -v c="$samples" 'BEGIN{if(c>0) printf("%.1f",a/c); else print "0"}') ms"
-  echo "探针B平均抖动   : $(awk -v a="$b_jit_sum" -v c="$samples" 'BEGIN{if(c>0) printf("%.1f",a/c); else print "0"}') ms"
-  echo "高CPU次数       : ${high_cpu}"
-  echo "高内存次数      : ${high_mem}"
-  echo "探针A高延迟次数 : ${high_a}"
-  echo "探针B高延迟次数 : ${high_b}"
-  echo "DNS异常次数     : ${dns_fail}"
-  echo "HTTPS异常次数   : ${http_fail}"
+  echo "综合诊断完成，日志: $logfile"
   echo
-
-  local perf_score=0 line_score=0 exit_score=0 platform_score=0
-  [[ "$high_cpu" -ge 2 ]] && perf_score=$((perf_score+3))
-  [[ "$high_mem" -ge 2 ]] && perf_score=$((perf_score+3))
-  [[ "$high_a" -ge 2 ]] && line_score=$((line_score+3))
-  [[ "$high_b" -ge 2 ]] && exit_score=$((exit_score+3))
-  [[ "$dns_fail" -ge 1 ]] && exit_score=$((exit_score+2))
-  [[ "$http_fail" -ge 1 ]] && exit_score=$((exit_score+3))
-  [[ "$perf_score" -eq 0 && "$line_score" -eq 0 && "$exit_score" -eq 0 ]] && platform_score=5
-
-  echo "性能问题分数     : ${perf_score}"
-  echo "链路问题分数     : ${line_score}"
-  echo "出口问题分数     : ${exit_score}"
-  echo "平台/编码分数    : ${platform_score}"
-  echo
-  ok "综合诊断（直播仿真）完成，日志已保存: $logfile"
-  echo
+  return 0
 }
 
 watch_once() {
@@ -478,6 +343,7 @@ watch_once() {
   echo "说明: $detail"
   echo
   echo "Ctrl+C 返回菜单，输入 q 后回车退出到命令行"
+  return 0
 }
 
 watch_loop() {
@@ -512,15 +378,15 @@ watch_loop() {
 
 show_recent_logs() {
   echo
-  say "最近日志"
   ls -lh "$LOG_DIR" 2>/dev/null || true
   echo
+  return 0
 }
 
 doctor_menu() {
   while true; do
     clear
-    cat <<EOF2
+    cat <<EOF
 ==============================
         CAST 诊断菜单
 ==============================
@@ -533,7 +399,7 @@ doctor_menu() {
 7. 实时监控
 0. 返回上级菜单
 ==============================
-EOF2
+EOF
 
     read -rp "请选择: " num
     case "$num" in
@@ -545,11 +411,11 @@ EOF2
       6) show_recent_logs ;;
       7)
         watch_loop
-        rc=$?
+        local rc=$?
         [[ "$rc" -eq 99 ]] && exit 0
         ;;
       0) return 0 ;;
-      *) warn "无效选择" ;;
+      *) echo "无效选择" ;;
     esac
     echo
     read -rp "按回车返回诊断菜单..." _
@@ -568,7 +434,7 @@ main() {
     monitor) light_monitor "${2:-60}" 5 8.8.8.8 ;;
     watch)
       watch_loop
-      rc=$?
+      local rc=$?
       [[ "$rc" -eq 99 ]] && exit 0
       ;;
     *)
@@ -582,7 +448,8 @@ main() {
       exit 1
       ;;
   esac
+
+  return 0
 }
 
 main "$@"
-EOF
