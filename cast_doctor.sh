@@ -4,8 +4,8 @@ set -euo pipefail
 CONF="/usr/local/etc/xray/config.json"
 PORT="443"
 
-HK_TEST_TARGET="1.1.1.1"
-GLOBAL_TEST_TARGET="8.8.8.8"
+HK_TEST_TARGET="8.8.8.8"
+GLOBAL_TEST_TARGET="1.1.1.1"
 
 BASE_DIR="/root/cast_data"
 LOG_DIR="${BASE_DIR}/logs"
@@ -43,7 +43,6 @@ install_deps() {
   need_cmd top procps
   need_cmd dig dnsutils
   need_cmd traceroute traceroute
-  need_cmd timeout coreutils
 }
 
 check_runtime_ready() {
@@ -89,76 +88,26 @@ dns_check() {
 }
 
 http_check() {
-  if curl -I -s --max-time 5 https://www.google.com >/dev/null 2>&1; then
+  if curl -I -s --max-time 5 https://www.cloudflare.com >/dev/null 2>&1; then
     echo "ok"
   else
     echo "fail"
   fi
 }
 
-ping_stat() {
+ping_probe() {
   local target="$1"
   local count="${2:-3}"
-  local out loss avg
-  out="$(ping -c "$count" -W 2 "$target" 2>/dev/null || true)"
+  local label="$3"
+
+  local out loss avg jitter
+  out="$(ping -c "$count" -W 1 "$target" 2>/dev/null || true)"
+
   loss="$(echo "$out" | awk -F',' '/packet loss/ {gsub(/ /,"",$3); gsub(/% packet loss/,"",$3); print $3}')"
   avg="$(echo "$out" | awk -F'/' '/^rtt|^round-trip/ {print $5}')"
-  echo "${loss:-100} ${avg:-999}"
-}
+  jitter="$(echo "$out" | awk -F'/' '/^rtt|^round-trip/ {print $7}')"
 
-tcp_probe() {
-  local host="$1"
-  local port="${2:-443}"
-  local count="${3:-6}"
-  local interval="${4:-3}"
-  local label="$5"
-
-  local results_file
-  results_file="$(mktemp)"
-  local ok=0 fail=0
-
-  for _ in $(seq 1 "$count"); do
-    local t
-    t="$(
-      (time -p timeout 3 bash -c "echo > /dev/tcp/${host}/${port}") 2>&1 \
-      | awk '/real/ {print $2*1000}'
-    )"
-
-    if [[ -n "$t" && "$t" != "0" ]]; then
-      echo "$t" >> "$results_file"
-      ok=$((ok+1))
-    else
-      fail=$((fail+1))
-    fi
-
-    sleep "$interval"
-  done
-
-  python3 - "$results_file" "$ok" "$fail" "$label" <<'PY'
-import sys, statistics
-
-path, ok, fail, label = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
-vals = []
-
-with open(path, "r", encoding="utf-8") as f:
-    for line in f:
-        line=line.strip()
-        if line:
-            vals.append(float(line))
-
-total = ok + fail
-loss = (fail / total * 100.0) if total > 0 else 100.0
-
-if vals:
-    avg = sum(vals)/len(vals)
-    mx = max(vals)
-    jitter = statistics.pstdev(vals) if len(vals) > 1 else 0.0
-    print(f"{label}|{avg:.1f}|{mx:.1f}|{loss:.1f}|{jitter:.1f}")
-else:
-    print(f"{label}|0.0|0.0|100.0|0.0")
-PY
-
-  rm -f "$results_file"
+  echo "${label}|${avg:-0}|${loss:-100}|${jitter:-0}"
 }
 
 show_header() {
@@ -207,18 +156,23 @@ safe_inspect() {
     show_resources
 
     say "低干扰网络检测"
-    local loss1 avg1 loss2 avg2 dns http
-    read -r loss1 avg1 <<< "$(ping_stat 8.8.8.8 3)"
-    read -r loss2 avg2 <<< "$(ping_stat 1.1.1.1 3)"
+    local hk_stats gl_stats dns http
+    hk_stats="$(ping_probe "$HK_TEST_TARGET" 3 "香港")"
+    gl_stats="$(ping_probe "$GLOBAL_TEST_TARGET" 3 "全球")"
     dns="$(dns_check)"
     http="$(http_check)"
 
-    echo "8.8.8.8 丢包 : ${loss1}%"
-    echo "8.8.8.8 延迟 : ${avg1} ms"
-    echo "1.1.1.1 丢包 : ${loss2}%"
-    echo "1.1.1.1 延迟 : ${avg2} ms"
-    echo "DNS状态      : ${dns}"
-    echo "HTTPS出口    : ${http}"
+    IFS='|' read -r hk_label hk_avg hk_loss hk_jit <<< "$hk_stats"
+    IFS='|' read -r gl_label gl_avg gl_loss gl_jit <<< "$gl_stats"
+
+    echo "${hk_label}延迟 : ${hk_avg} ms"
+    echo "${hk_label}丢包 : ${hk_loss}%"
+    echo "${hk_label}抖动 : ${hk_jit} ms"
+    echo "${gl_label}延迟 : ${gl_avg} ms"
+    echo "${gl_label}丢包 : ${gl_loss}%"
+    echo "${gl_label}抖动 : ${gl_jit} ms"
+    echo "DNS状态    : ${dns}"
+    echo "HTTPS出口  : ${http}"
     echo
 
     say "自动判断"
@@ -232,13 +186,11 @@ safe_inspect() {
     awk "BEGIN{exit !($mem > 90)}" && { err "更像是本机内存压力过高"; FLAG=1; }
     [[ "$disk" -ge 90 ]] 2>/dev/null && { warn "磁盘占用偏高"; FLAG=1; }
 
-    [[ "$loss1" -ge 10 ]] 2>/dev/null && { err "更像是线路丢包问题"; FLAG=1; }
-    [[ "$loss2" -ge 10 ]] 2>/dev/null && { err "更像是线路丢包问题"; FLAG=1; }
-
-    awk "BEGIN{exit !(($avg1 > 200) || ($avg2 > 200))}" && { err "更像是线路延迟过高"; FLAG=1; }
+    awk "BEGIN{exit !(($hk_avg > 200) || ($gl_avg > 200))}" && { warn "延迟偏高"; FLAG=1; }
+    awk "BEGIN{exit !(($hk_jit > 60) || ($gl_jit > 80))}" && { warn "抖动偏高"; FLAG=1; }
 
     [[ "$dns" != "ok" ]] && { err "更像是 DNS 解析异常"; FLAG=1; }
-    [[ "$http" != "ok" ]] && { warn "HTTPS 出口访问异常"; FLAG=1; }
+    [[ "$http" != "ok" ]] && { err "HTTPS 出口访问异常"; FLAG=1; }
 
     if [[ "$FLAG" -eq 0 ]]; then
       ok "当前基础指标正常，更像是偶发波动、平台侧波动，或直播端编码参数问题"
@@ -260,7 +212,7 @@ light_monitor() {
   iface="$(get_iface)"
   logfile="${LOG_DIR}/monitor_${duration}s_$(date +%F_%H%M%S).csv"
 
-  echo "time,cpu_usage,mem_usage,load1,rx_bytes,tx_bytes,ping_ms,loss_percent" > "$logfile"
+  echo "time,cpu_usage,mem_usage,load1,rx_bytes,tx_bytes,ping_ms,loss_percent,jitter_ms" > "$logfile"
 
   say "开始轻量监控 ${duration} 秒，每 ${interval} 秒采样一次"
   say "这是低干扰模式，不会改网络，也不会断网"
@@ -269,16 +221,17 @@ light_monitor() {
   local count=$((duration / interval))
   [[ "$count" -lt 1 ]] && count=1
 
-  local high_loss=0
   local high_ping=0
+  local high_jitter=0
   local high_cpu=0
   local high_mem=0
   local ping_sum=0
   local loss_sum=0
+  local jitter_sum=0
   local samples=0
 
   for ((i=1; i<=count; i++)); do
-    local now cpu mem load rx tx loss ping
+    local now cpu mem load rx tx stats avg loss jit label
     now="$(date '+%F %T')"
     cpu="$(cpu_usage)"
     mem="$(mem_usage)"
@@ -286,41 +239,47 @@ light_monitor() {
     rx="$(cat "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null || echo 0)"
     tx="$(cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null || echo 0)"
 
-    read -r loss ping <<< "$(ping_stat "$target" 3)"
+    stats="$(ping_probe "$target" 3 "监控")"
+    IFS='|' read -r label avg loss jit <<< "$stats"
+
+    [[ -z "${avg:-}" ]] && avg=0
     [[ -z "${loss:-}" ]] && loss=100
-    [[ -z "${ping:-}" ]] && ping=999
+    [[ -z "${jit:-}" ]] && jit=0
 
-    echo "${now},${cpu},${mem},${load},${rx},${tx},${ping},${loss}" | tee -a "$logfile"
+    echo "${now},${cpu},${mem},${load},${rx},${tx},${avg},${loss},${jit}" | tee -a "$logfile"
 
-    ping_sum="$(awk -v a="$ping_sum" -v b="$ping" 'BEGIN{print a+b}')"
+    ping_sum="$(awk -v a="$ping_sum" -v b="$avg" 'BEGIN{print a+b}')"
     loss_sum="$(awk -v a="$loss_sum" -v b="$loss" 'BEGIN{print a+b}')"
+    jitter_sum="$(awk -v a="$jitter_sum" -v b="$jit" 'BEGIN{print a+b}')"
     samples=$((samples+1))
 
-    awk "BEGIN{exit !($loss >= 10)}" && { err "告警：丢包 ${loss}%"; high_loss=$((high_loss+1)); }
-    awk "BEGIN{exit !($ping > 200)}" && { err "告警：延迟 ${ping} ms"; high_ping=$((high_ping+1)); }
+    awk "BEGIN{exit !($avg > 200)}" && { warn "告警：延迟 ${avg} ms"; high_ping=$((high_ping+1)); }
+    awk "BEGIN{exit !($jit > 80)}" && { warn "告警：抖动 ${jit} ms"; high_jitter=$((high_jitter+1)); }
     awk "BEGIN{exit !($cpu > 85)}" && { warn "告警：CPU ${cpu}%"; high_cpu=$((high_cpu+1)); }
     awk "BEGIN{exit !($mem > 90)}" && { warn "告警：内存 ${mem}%"; high_mem=$((high_mem+1)); }
 
     sleep "$interval"
   done
 
-  local avg_ping avg_loss
+  local avg_ping avg_loss avg_jitter
   avg_ping="$(awk -v a="$ping_sum" -v c="$samples" 'BEGIN{if(c>0) printf("%.1f",a/c); else print "0"}')"
   avg_loss="$(awk -v a="$loss_sum" -v c="$samples" 'BEGIN{if(c>0) printf("%.1f",a/c); else print "0"}')"
+  avg_jitter="$(awk -v a="$jitter_sum" -v c="$samples" 'BEGIN{if(c>0) printf("%.1f",a/c); else print "0"}')"
 
   echo
   say "监控总结"
   echo "平均延迟      : ${avg_ping} ms"
   echo "平均丢包      : ${avg_loss}%"
+  echo "平均抖动      : ${avg_jitter} ms"
   echo "高延迟次数    : ${high_ping}"
-  echo "高丢包次数    : ${high_loss}"
+  echo "高抖动次数    : ${high_jitter}"
   echo "高CPU次数     : ${high_cpu}"
   echo "高内存次数    : ${high_mem}"
   echo
 
   local FLAG=0
-  [[ "$high_loss" -ge 2 ]] && { err "更像是链路存在持续丢包"; FLAG=1; }
-  [[ "$high_ping" -ge 2 ]] && { err "更像是链路存在明显抖动或拥塞"; FLAG=1; }
+  [[ "$high_ping" -ge 2 ]] && { warn "更像是链路存在明显延迟波动"; FLAG=1; }
+  [[ "$high_jitter" -ge 2 ]] && { warn "更像是链路存在明显抖动"; FLAG=1; }
   [[ "$high_cpu" -ge 2 ]] && { err "更像是 VPS CPU 性能瓶颈"; FLAG=1; }
   [[ "$high_mem" -ge 2 ]] && { err "更像是 VPS 内存瓶颈"; FLAG=1; }
 
@@ -343,16 +302,17 @@ deep_diag() {
     show_resources
 
     say "详细网络检测"
-    local loss1 avg1 loss2 avg2 loss3 avg3 dns http
-    read -r loss1 avg1 <<< "$(ping_stat 8.8.8.8 5)"
-    read -r loss2 avg2 <<< "$(ping_stat 1.1.1.1 5)"
-    read -r loss3 avg3 <<< "$(ping_stat google.com 5)"
-
-    echo "8.8.8.8   -> 丢包 ${loss1}% / 延迟 ${avg1} ms"
-    echo "1.1.1.1   -> 丢包 ${loss2}% / 延迟 ${avg2} ms"
-    echo "google.com-> 丢包 ${loss3}% / 延迟 ${avg3} ms"
+    local hk_stats gl_stats dns http
+    hk_stats="$(ping_probe "$HK_TEST_TARGET" 5 "香港")"
+    gl_stats="$(ping_probe "$GLOBAL_TEST_TARGET" 5 "全球")"
     dns="$(dns_check)"
     http="$(http_check)"
+
+    IFS='|' read -r hk_label hk_avg hk_loss hk_jit <<< "$hk_stats"
+    IFS='|' read -r gl_label gl_avg gl_loss gl_jit <<< "$gl_stats"
+
+    echo "${hk_label} -> 延迟 ${hk_avg} ms / 丢包 ${hk_loss}% / 抖动 ${hk_jit} ms"
+    echo "${gl_label} -> 延迟 ${gl_avg} ms / 丢包 ${gl_loss}% / 抖动 ${gl_jit} ms"
     echo "DNS       -> ${dns}"
     echo "HTTPS出口 -> ${http}"
     echo
@@ -374,14 +334,11 @@ deep_diag() {
     awk "BEGIN{exit !($mem > 90)}" && { err "更像是本机内存压力过高"; FLAG=1; }
     [[ "$disk" -ge 90 ]] 2>/dev/null && { warn "磁盘占用偏高"; FLAG=1; }
 
-    [[ "$loss1" -ge 10 ]] 2>/dev/null && { err "更像是线路丢包问题"; FLAG=1; }
-    [[ "$loss2" -ge 10 ]] 2>/dev/null && { err "更像是线路丢包问题"; FLAG=1; }
-    [[ "$loss3" -ge 10 ]] 2>/dev/null && { err "更像是目标出口链路不稳定"; FLAG=1; }
-
-    awk "BEGIN{exit !(($avg1 > 200) || ($avg2 > 200) || ($avg3 > 200))}" && { err "更像是线路延迟过高"; FLAG=1; }
+    awk "BEGIN{exit !(($hk_avg > 200) || ($gl_avg > 200))}" && { warn "更像是线路延迟过高"; FLAG=1; }
+    awk "BEGIN{exit !(($hk_jit > 60) || ($gl_jit > 80))}" && { warn "更像是线路抖动偏高"; FLAG=1; }
 
     [[ "$dns" != "ok" ]] && { err "更像是 DNS 解析异常"; FLAG=1; }
-    [[ "$http" != "ok" ]] && { warn "HTTPS 出口访问异常"; FLAG=1; }
+    [[ "$http" != "ok" ]] && { err "更像是 HTTPS 出口异常"; FLAG=1; }
 
     if [[ "$FLAG" -eq 0 ]]; then
       ok "深度诊断未发现明显异常，更像是直播推流参数、平台侧波动或上游链路偶发问题"
@@ -399,7 +356,7 @@ live_sim_diag() {
   iface="$(get_iface)"
   logfile="${LOG_DIR}/sim_${duration}s_$(date +%F_%H%M%S).csv"
 
-  echo "time,cpu_usage,mem_usage,load1,rx_bytes,tx_bytes,hk_tcp_ms,hk_loss,hk_jitter,gl_tcp_ms,gl_loss,gl_jitter,dns,http" > "$logfile"
+  echo "time,cpu_usage,mem_usage,load1,rx_bytes,tx_bytes,hk_ping_ms,hk_loss,hk_jitter,gl_ping_ms,gl_loss,gl_jitter,dns,http" > "$logfile"
 
   say "开始综合诊断（直播仿真）"
   say "说明：低干扰连续采样，尽量接近直播时的持续状态"
@@ -411,15 +368,15 @@ live_sim_diag() {
   [[ "$count" -lt 1 ]] && count=1
 
   local cpu_sum=0 mem_sum=0 hk_sum=0 gl_sum=0 hk_loss_sum=0 gl_loss_sum=0
-  local cpu_max=0 mem_max=0 hk_max=0 gl_max=0 hk_loss_max=0 gl_loss_max=0
-  local high_cpu=0 high_mem=0 high_hk=0 high_gl=0 high_hk_loss=0 high_gl_loss=0
+  local cpu_max=0 mem_max=0 hk_max=0 gl_max=0
+  local high_cpu=0 high_mem=0 high_hk=0 high_gl=0
   local hk_jitter_sum=0 gl_jitter_sum=0
   local dns_fail=0 http_fail=0
   local samples=0
 
   for ((i=1; i<=count; i++)); do
     local now cpu mem load rx tx dns http
-    local hk_stats gl_stats hk_avg hk_max_one hk_loss hk_jitter gl_avg gl_max_one gl_loss gl_jitter
+    local hk_stats gl_stats hk_avg hk_loss hk_jitter gl_avg gl_loss gl_jitter
 
     now="$(date '+%F %T')"
     cpu="$(cpu_usage)"
@@ -430,11 +387,11 @@ live_sim_diag() {
     dns="$(dns_check)"
     http="$(http_check)"
 
-    hk_stats="$(tcp_probe "$HK_TEST_TARGET" 443 3 1 "HK")"
-    gl_stats="$(tcp_probe "$GLOBAL_TEST_TARGET" 443 3 1 "GL")"
+    hk_stats="$(ping_probe "$HK_TEST_TARGET" 3 "香港")"
+    gl_stats="$(ping_probe "$GLOBAL_TEST_TARGET" 3 "全球")"
 
-    IFS='|' read -r _ hk_avg hk_max_one hk_loss hk_jitter <<< "$hk_stats"
-    IFS='|' read -r _ gl_avg gl_max_one gl_loss gl_jitter <<< "$gl_stats"
+    IFS='|' read -r _ hk_avg hk_loss hk_jitter <<< "$hk_stats"
+    IFS='|' read -r _ gl_avg gl_loss gl_jitter <<< "$gl_stats"
 
     echo "${now},${cpu},${mem},${load},${rx},${tx},${hk_avg},${hk_loss},${hk_jitter},${gl_avg},${gl_loss},${gl_jitter},${dns},${http}" | tee -a "$logfile"
 
@@ -452,15 +409,11 @@ live_sim_diag() {
     awk "BEGIN{exit !($mem > $mem_max)}" && mem_max="$mem"
     awk "BEGIN{exit !($hk_avg > $hk_max)}" && hk_max="$hk_avg"
     awk "BEGIN{exit !($gl_avg > $gl_max)}" && gl_max="$gl_avg"
-    awk "BEGIN{exit !($hk_loss > $hk_loss_max)}" && hk_loss_max="$hk_loss"
-    awk "BEGIN{exit !($gl_loss > $gl_loss_max)}" && gl_loss_max="$gl_loss"
 
     awk "BEGIN{exit !($cpu > 85)}" && high_cpu=$((high_cpu+1))
     awk "BEGIN{exit !($mem > 90)}" && high_mem=$((high_mem+1))
     awk "BEGIN{exit !($hk_avg > 200)}" && high_hk=$((high_hk+1))
     awk "BEGIN{exit !($gl_avg > 250)}" && high_gl=$((high_gl+1))
-    awk "BEGIN{exit !($hk_loss >= 10)}" && high_hk_loss=$((high_hk_loss+1))
-    awk "BEGIN{exit !($gl_loss >= 10)}" && high_gl_loss=$((high_gl_loss+1))
 
     [[ "$dns" != "ok" ]] && dns_fail=$((dns_fail+1))
     [[ "$http" != "ok" ]] && http_fail=$((http_fail+1))
@@ -484,22 +437,16 @@ live_sim_diag() {
   echo "峰值CPU         : ${cpu_max}%"
   echo "平均内存        : ${avg_mem}%"
   echo "峰值内存        : ${mem_max}%"
-  echo "香港平均TCP     : ${avg_hk} ms"
-  echo "香港峰值TCP     : ${hk_max} ms"
+  echo "香港平均延迟    : ${avg_hk} ms"
   echo "香港平均丢包    : ${avg_hk_loss}%"
-  echo "香港峰值丢包    : ${hk_loss_max}%"
   echo "香港平均抖动    : ${avg_hk_jitter} ms"
-  echo "全球平均TCP     : ${avg_gl} ms"
-  echo "全球峰值TCP     : ${gl_max} ms"
+  echo "全球平均延迟    : ${avg_gl} ms"
   echo "全球平均丢包    : ${avg_gl_loss}%"
-  echo "全球峰值丢包    : ${gl_loss_max}%"
   echo "全球平均抖动    : ${avg_gl_jitter} ms"
   echo "高CPU次数       : ${high_cpu}"
   echo "高内存次数      : ${high_mem}"
   echo "香港高延迟次数  : ${high_hk}"
   echo "全球高延迟次数  : ${high_gl}"
-  echo "香港高丢包次数  : ${high_hk_loss}"
-  echo "全球高丢包次数  : ${high_gl_loss}"
   echo "DNS异常次数     : ${dns_fail}"
   echo "HTTPS异常次数   : ${http_fail}"
   echo
@@ -517,27 +464,13 @@ live_sim_diag() {
   awk "BEGIN{exit !($mem_max > 90)}" && perf_score=$((perf_score+3))
   [[ "$high_mem" -ge 2 ]] && perf_score=$((perf_score+3))
 
-  # 链路判断：优先看延迟和抖动，loss只做辅因子
   awk "BEGIN{exit !($avg_hk > 120)}" && line_score=$((line_score+2))
-  awk "BEGIN{exit !($hk_max > 200)}" && line_score=$((line_score+2))
   awk "BEGIN{exit !($avg_hk_jitter > 40)}" && line_score=$((line_score+3))
   [[ "$high_hk" -ge 2 ]] && line_score=$((line_score+2))
 
-  # 只有当延迟/抖动也偏高时，loss才加分
-  if (( $(echo "$avg_hk > 80 || $avg_hk_jitter > 30" | bc -l) )); then
-    awk "BEGIN{exit !($avg_hk_loss >= 20)}" && line_score=$((line_score+2))
-    [[ "$high_hk_loss" -ge 2 ]] && line_score=$((line_score+2))
-  fi
-
   awk "BEGIN{exit !($avg_gl > 180)}" && exit_score=$((exit_score+2))
-  awk "BEGIN{exit !($gl_max > 250)}" && exit_score=$((exit_score+2))
   awk "BEGIN{exit !($avg_gl_jitter > 50)}" && exit_score=$((exit_score+3))
   [[ "$high_gl" -ge 2 ]] && exit_score=$((exit_score+2))
-
-  if (( $(echo "$avg_gl > 150 || $avg_gl_jitter > 35" | bc -l) )); then
-    awk "BEGIN{exit !($avg_gl_loss >= 20)}" && exit_score=$((exit_score+2))
-    [[ "$high_gl_loss" -ge 2 ]] && exit_score=$((exit_score+2))
-  fi
 
   [[ "$dns_fail" -ge 1 ]] && exit_score=$((exit_score+2))
   [[ "$http_fail" -ge 1 ]] && exit_score=$((exit_score+3))
@@ -546,12 +479,35 @@ live_sim_diag() {
     platform_score=$((platform_score+5))
   fi
 
-  say "综合结论"
-  echo "最可能原因      : ${top_reason:-未识别}"
-  [[ -n "${second_reason:-}" ]] && echo "次可能原因      : ${second_reason}"
-  echo
+  echo "--------------------------------------"
+  say "综合评分"
+  echo "性能问题分数     : ${perf_score}"
+  echo "链路问题分数     : ${line_score}"
+  echo "出口问题分数     : ${exit_score}"
+  echo "平台/编码分数    : ${platform_score}"
+  echo "--------------------------------------"
 
-  say "判断依据"
+  local max_score=0
+  local top_reason=""
+  local second_score=0
+  local second_reason=""
+
+  for item in "性能问题:${perf_score}" "链路问题:${line_score}" "出口问题:${exit_score}" "平台/编码问题:${platform_score}"; do
+    local name score
+    name="${item%%:*}"
+    score="${item##*:}"
+
+    if [[ "$score" -gt "$max_score" ]]; then
+      second_score="$max_score"
+      second_reason="$top_reason"
+      max_score="$score"
+      top_reason="$name"
+    elif [[ "$score" -gt "$second_score" ]]; then
+      second_score="$score"
+      second_reason="$name"
+    fi
+  done
+
   say "综合结论"
   echo "最可能原因      : ${top_reason:-未识别}"
   [[ -n "${second_reason:-}" ]] && echo "次可能原因      : ${second_reason}"
@@ -623,11 +579,11 @@ watch_once() {
     https_ok="FAIL"
   fi
 
-  hk_stats="$(tcp_probe "$HK_TEST_TARGET" 443 2 1 "香港")"
-  gl_stats="$(tcp_probe "$GLOBAL_TEST_TARGET" 443 2 1 "全球")"
+  hk_stats="$(ping_probe "$HK_TEST_TARGET" 2 "香港")"
+  gl_stats="$(ping_probe "$GLOBAL_TEST_TARGET" 2 "全球")"
 
-  IFS='|' read -r _ hk_avg _ hk_loss hk_jit <<< "$hk_stats"
-  IFS='|' read -r _ gl_avg _ gl_loss gl_jit <<< "$gl_stats"
+  IFS='|' read -r _ hk_avg hk_loss hk_jit <<< "$hk_stats"
+  IFS='|' read -r _ gl_avg gl_loss gl_jit <<< "$gl_stats"
 
   level="稳定"
   verdict="直播正常"
@@ -680,8 +636,8 @@ watch_once() {
   echo "443连接数: $conn_count"
   echo "HTTPS出口: $https_ok"
   echo
-  echo "香港TCP: ${hk_avg}ms / loss ${hk_loss}% / jitter ${hk_jit}ms"
-  echo "全球TCP: ${gl_avg}ms / loss ${gl_loss}% / jitter ${gl_jit}ms"
+  echo "香港: ${hk_avg}ms / loss ${hk_loss}% / jitter ${hk_jit}ms"
+  echo "全球: ${gl_avg}ms / loss ${gl_loss}% / jitter ${gl_jit}ms"
   echo
   echo "等级: $level"
   echo "状态: $verdict"
