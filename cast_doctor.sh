@@ -1,3 +1,4 @@
+cat > /root/cast_doctor.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -103,11 +104,20 @@ ping_probe() {
   local out loss avg jitter
   out="$(ping -c "$count" -W 1 "$target" 2>/dev/null || true)"
 
-  loss="$(echo "$out" | awk -F',' '/packet loss/ {gsub(/ /,"",$3); gsub(/% packet loss/,"",$3); print $3}')"
+  loss="$(echo "$out" | awk -F',' '/packet loss/ {
+    gsub(/^ +| +$/, "", $3)
+    sub(/% packet loss/, "", $3)
+    print $3
+  }')"
+
   avg="$(echo "$out" | awk -F'/' '/^rtt|^round-trip/ {print $5}')"
   jitter="$(echo "$out" | awk -F'/' '/^rtt|^round-trip/ {print $7}')"
 
-  echo "${label}|${avg:-0}|${loss:-100}|${jitter:-0}"
+  [[ -z "${loss:-}" ]] && loss="100"
+  [[ -z "${avg:-}" ]] && avg="0"
+  [[ -z "${jitter:-}" ]] && jitter="0"
+
+  printf '%s|%.3f|%s|%.3f\n' "$label" "$avg" "$loss" "$jitter"
 }
 
 show_header() {
@@ -643,16 +653,46 @@ watch_once() {
   echo "状态: $verdict"
   echo "说明: $detail"
   echo
-  echo "按 Ctrl + C 退出"
+  echo "Ctrl+C 返回菜单，输入 q 后回车退出到命令行"
 }
 
 watch_loop() {
   install_deps
   check_runtime_ready || true
+
+  local stop_flag=0
+  local quit_flag=0
+  local key=""
+
+  trap 'stop_flag=1' INT
+
   while true; do
+    [[ "$stop_flag" -eq 1 ]] && break
+
     watch_once
-    sleep 5
+
+    key=""
+    if read -r -t 5 key 2>/dev/null; then
+      case "$key" in
+        q|Q)
+          quit_flag=1
+          break
+          ;;
+      esac
+    fi
   done
+
+  trap - INT
+  echo
+
+  if [[ "$quit_flag" -eq 1 ]]; then
+    echo "已结束监控，退出到命令行。"
+    return 99
+  else
+    echo "已结束监控，返回菜单..."
+    sleep 1
+    return 0
+  fi
 }
 
 show_recent_logs() {
@@ -682,7 +722,11 @@ main_menu() {
     4) light_monitor 180 5 8.8.8.8 ;;
     5) deep_diag ;;
     6) show_recent_logs ;;
-    7) watch_loop ;;
+    7)
+      watch_loop
+      rc=$?
+      [[ "$rc" -eq 99 ]] && exit 0
+      ;;
     0) exit 0 ;;
     *) warn "无效选择" ;;
   esac
@@ -712,6 +756,8 @@ main() {
       ;;
     watch)
       watch_loop
+      rc=$?
+      [[ "$rc" -eq 99 ]] && exit 0
       ;;
     *)
       echo "用法:"
@@ -727,3 +773,4 @@ main() {
 }
 
 main "$@"
+EOF
