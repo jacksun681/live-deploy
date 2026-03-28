@@ -41,24 +41,33 @@ normalize_file() {
 precheck() {
   [[ "$(id -u)" -eq 0 ]] || { echo "请用 root 运行"; exit 1; }
   command -v systemctl >/dev/null 2>&1 || { echo "系统缺少 systemd"; exit 1; }
+
   case "$(uname -m)" in
     x86_64|aarch64) ;;
-    *) echo "暂不支持此架构: $(uname -m)"; exit 1 ;;
+    *)
+      echo "暂不支持此架构: $(uname -m)"
+      exit 1
+      ;;
   esac
+
+  return 0
 }
 
 install_deps() {
   need_cmd curl curl
   need_cmd jq jq
+  return 0
 }
 
 download_one() {
   local dest="$1"
   shift
+
   local tmp=""
   tmp="$(mktemp)"
   trap '[ -n "${tmp:-}" ] && rm -f "$tmp"' RETURN
 
+  local url
   for url in "$@"; do
     echo "[尝试下载] $url"
 
@@ -69,10 +78,10 @@ download_one() {
 
     normalize_file "$tmp"
 
-    grep -q '^#!/usr/bin/env bash' "$tmp" || {
+    if ! grep -q '^#!/usr/bin/env bash' "$tmp"; then
       echo "[跳过] 不是 bash 脚本"
       continue
-    }
+    fi
 
     if grep -qi '<!DOCTYPE html>\|<html' "$tmp"; then
       echo "[跳过] 返回的是 HTML 页面"
@@ -86,17 +95,27 @@ download_one() {
 
     install -m 755 "$tmp" "$dest"
     normalize_file "$dest"
+
     echo "[成功] 已安装到 $dest"
     return 0
   done
 
+  echo "[失败] 所有下载源都不可用"
   return 1
 }
 
 backup_old() {
   mkdir -p "$BACKUP_DIR"
-  [[ -f "$MENU_REAL" ]] && cp "$MENU_REAL" "$BACKUP_DIR/cast_menu.last"
-  [[ -f "$DOCTOR_REAL" ]] && cp "$DOCTOR_REAL" "$BACKUP_DIR/cast_doctor.last"
+
+  if [[ -f "$MENU_REAL" ]]; then
+    cp "$MENU_REAL" "$BACKUP_DIR/cast_menu.last"
+  fi
+
+  if [[ -f "$DOCTOR_REAL" ]]; then
+    cp "$DOCTOR_REAL" "$BACKUP_DIR/cast_doctor.last"
+  fi
+
+  return 0
 }
 
 create_wrapper() {
@@ -130,7 +149,7 @@ case "${1:-menu}" in
     cat <<EOT
 用法:
   cast            打开菜单
-  cast doctor     一次性诊断菜单
+  cast doctor     打开诊断菜单
   cast watch      实时监控
   cast update     更新本地版本
   cast rollback   回滚到上一个版本
@@ -145,17 +164,21 @@ EOF
 
   chmod +x "$CMD_PATH"
   normalize_file "$CMD_PATH"
+  return 0
 }
 
 rollback_main() {
-  [[ -f "$BACKUP_DIR/cast_menu.last" ]] || { echo "没有可回滚版本"; exit 1; }
-  [[ -f "$BACKUP_DIR/cast_doctor.last" ]] || { echo "没有可回滚版本"; exit 1; }
+  [[ -f "$BACKUP_DIR/cast_menu.last" ]] || { echo "没有可回滚的 cast_menu 版本"; exit 1; }
+  [[ -f "$BACKUP_DIR/cast_doctor.last" ]] || { echo "没有可回滚的 cast_doctor 版本"; exit 1; }
 
   cp "$BACKUP_DIR/cast_menu.last" "$MENU_REAL"
   cp "$BACKUP_DIR/cast_doctor.last" "$DOCTOR_REAL"
   chmod +x "$MENU_REAL" "$DOCTOR_REAL"
+
   create_wrapper
+
   echo "[回滚完成]"
+  return 0
 }
 
 show_help() {
@@ -175,6 +198,7 @@ EOF
 
 self_fix() {
   [[ -f "$LOCAL_INSTALLER" ]] && normalize_file "$LOCAL_INSTALLER"
+  return 0
 }
 
 first_bootstrap() {
@@ -183,6 +207,7 @@ first_bootstrap() {
     echo "[初始化] 正在自动初始化并输出主链接..."
     bash "$MENU_REAL" --bootstrap || true
   fi
+  return 0
 }
 
 main() {
@@ -209,6 +234,8 @@ main() {
       show_help
       ;;
   esac
+
+  return 0
 }
 
 main "${1:-help}"
