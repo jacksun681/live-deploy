@@ -397,6 +397,20 @@ for i,c in enumerate(clients,1):
 PY
 }
 
+show_user_index_list() {
+  echo "当前用户列表："
+  while IFS='|' read -r idx name uuid flow; do
+    [[ -z "$uuid" ]] && continue
+    echo "  $idx. $name"
+  done < <(list_users_raw)
+  echo
+}
+
+user_name_by_index() {
+  local idx="$1"
+  list_users_raw | awk -F'|' -v i="$idx" '$1==i{print $2}'
+}
+
 build_link() {
   local uuid="$1"
   local name="$2"
@@ -412,17 +426,7 @@ build_link() {
 
 ensure_default_user() {
   local count
-  count="$(python3 - <<'PY'
-import json, os
-conf="/usr/local/etc/xray/config.json"
-if not os.path.exists(conf):
-    print(0)
-else:
-    with open(conf,"r",encoding="utf-8") as f:
-        data=json.load(f)
-    print(len(data["inbounds"][0].get("settings", {}).get("clients", [])))
-PY
-)"
+  count="$(list_users_raw | wc -l | awk '{print $1}')"
   if [[ "$count" -eq 0 ]]; then
     python3 - "$(new_uuid)" <<'PY'
 import json, sys
@@ -478,10 +482,10 @@ show_links() {
 
 add_user() {
   ensure_base_config
-  local name uuid
-  read -rp "请输入新用户名（如 user2）: " name
-  [[ -z "$name" ]] && { echo "用户名不能为空"; return; }
-
+  local next_num name uuid
+  next_num="$(list_users_raw | wc -l | awk '{print $1}')"
+  next_num=$((next_num + 1))
+  name="user${next_num}"
   uuid="$(new_uuid)"
 
 python3 - "$name" "$uuid" <<'PY'
@@ -494,11 +498,6 @@ with open(conf,"r",encoding="utf-8") as f:
 
 settings = data["inbounds"][0].setdefault("settings", {})
 clients = settings.setdefault("clients", [])
-
-for c in clients:
-    if c.get("email")==name:
-        print("该用户名已存在")
-        sys.exit(1)
 
 clients.append({
     "id": uuid,
@@ -520,9 +519,14 @@ PY
 
 delete_user() {
   ensure_base_config
-  local name
-  read -rp "请输入要删除的用户名: " name
-  [[ -z "$name" ]] && { echo "用户名不能为空"; return; }
+  show_user_index_list
+
+  local idx name
+  read -rp "请输入要删除的用户序号: " idx
+  [[ "$idx" =~ ^[0-9]+$ ]] || { echo "请输入数字序号"; return 1; }
+
+  name="$(user_name_by_index "$idx")"
+  [[ -n "$name" ]] || { echo "序号无效"; return 1; }
 
 python3 - "$name" <<'PY'
 import json, sys
@@ -556,9 +560,14 @@ PY
 
 reset_user() {
   ensure_base_config
-  local name uuid
-  read -rp "请输入要重置的用户名: " name
-  [[ -z "$name" ]] && { echo "用户名不能为空"; return; }
+  show_user_index_list
+
+  local idx name uuid
+  read -rp "请输入要重置的用户序号: " idx
+  [[ "$idx" =~ ^[0-9]+$ ]] || { echo "请输入数字序号"; return 1; }
+
+  name="$(user_name_by_index "$idx")"
+  [[ -n "$name" ]] || { echo "序号无效"; return 1; }
 
   uuid="$(new_uuid)"
 
