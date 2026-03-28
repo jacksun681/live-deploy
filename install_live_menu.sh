@@ -38,11 +38,13 @@ precheck() {
     x86_64|aarch64) ;;
     *) echo "暂不支持此架构: $(uname -m)"; exit 1 ;;
   esac
+  return 0
 }
 
 install_deps() {
   need_cmd curl curl
   need_cmd jq jq
+  return 0
 }
 
 download_main() {
@@ -124,7 +126,7 @@ EOT
     ;;
   *)
     [[ -f "$REAL_PATH" ]] || { echo "主程序不存在，请先执行安装"; exit 1; }
-    exec bash "$REAL_PATH"
+    exec bash "$REAL_PATH" "$@"
     ;;
 esac
 EOF
@@ -132,6 +134,7 @@ EOF
   chmod +x "$MENU_PATH"
   normalize_file "$MENU_PATH"
   ln -sf "$MENU_PATH" "$COMPAT_PATH"
+  return 0
 }
 
 rollback_main() {
@@ -141,6 +144,7 @@ rollback_main() {
   chmod +x "$REAL_PATH"
   create_wrapper
   echo "[回滚完成]"
+  return 0
 }
 
 show_help() {
@@ -149,20 +153,13 @@ show_help() {
   bash /root/install_live_menu.sh install   安装/更新
   bash /root/install_live_menu.sh rollback  回滚
   bash /root/install_live_menu.sh path      查看路径
-
-安装后可直接使用:
-  menu
-  menu update
-  menu rollback
-  menu path
-
-兼容旧命令:
-  live_menu
 EOF
+  return 0
 }
 
 self_fix() {
   [[ -f "$LOCAL_INSTALLER" ]] && normalize_file "$LOCAL_INSTALLER"
+  return 0
 }
 
 first_bootstrap() {
@@ -171,6 +168,7 @@ first_bootstrap() {
     echo "[初始化] 正在自动初始化并输出主链接..."
     bash "$REAL_PATH" --bootstrap || true
   fi
+  return 0
 }
 
 main() {
@@ -195,6 +193,8 @@ main() {
       show_help
       ;;
   esac
+
+  return 0
 }
 
 main "${1:-help}"
