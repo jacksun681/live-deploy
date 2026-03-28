@@ -336,7 +336,10 @@ print(data["inbounds"][0]["streamSettings"]["realitySettings"].get("privateKey",
 PY
 )"
   [[ -z "$pri" ]] && return 1
-  xray x25519 -i "$pri" 2>/dev/null | awk -F': ' '/Public key|PublicKey|Password/ {print $2}' | head -n1 | tr -d '\r'
+
+  xray x25519 -i "$pri" 2>/dev/null \
+    | sed -n 's/^Password (PublicKey): //p; s/^Public key: //p; s/^PublicKey: //p' \
+    | head -n1 | tr -d '\r'
 }
 
 list_users_raw() {
@@ -394,11 +397,16 @@ PY
 print_main_link() {
   ensure_base_config
   ensure_main_user
+
+  local link=""
   while IFS='|' read -r idx name uuid flow; do
     [[ "$name" == "$MAIN_USER" ]] || continue
-    build_link "$uuid" "$name" "$flow"
+    link="$(build_link "$uuid" "$name" "$flow" || true)"
+    [[ -n "$link" ]] || { echo "生成主链接失败"; return 1; }
+    echo "$link"
     return 0
   done < <(list_users_raw)
+
   echo "未找到主用户"
   return 1
 }
@@ -407,10 +415,16 @@ print_first_bootstrap() {
   echo
   echo "====== CAST 部署完成 ======"
   echo
-  print_main_link
+
+  if ! print_main_link; then
+    echo "主链接输出失败"
+    return 1
+  fi
+
   echo
   echo "管理命令: cast"
   echo
+  return 0
 }
 
 show_links() {
@@ -603,12 +617,12 @@ EOF2
 }
 
 case "${1:-}" in
-  --bootstrap)
-    ensure_base_config
-    ensure_main_user
-    print_first_bootstrap
-    exit 0
-    ;;
+--bootstrap)
+  ensure_base_config
+  ensure_main_user
+  print_first_bootstrap || true
+  exit 0
+  ;;
 esac
 
 while true; do
