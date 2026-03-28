@@ -1,4 +1,3 @@
-cat > /root/cast_menu.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -34,16 +33,19 @@ install_deps() {
   need_cmd ping iputils-ping
   need_cmd ip iproute2
   need_cmd bc bc
+  return 0
 }
 
 install_xray() {
   command -v xray >/dev/null 2>&1 || \
     bash <(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh) install
+  return 0
 }
 
 ensure_conf_link() {
   mkdir -p /etc/xray
   ln -sf "$CONF" "$ETC_CONF"
+  return 0
 }
 
 new_uuid() {
@@ -63,7 +65,7 @@ make_keys() {
   pri="$(echo "$raw" | awk -F': ' '/Private key|PrivateKey/ {print $2}' | head -n1 | tr -d '\r')"
   [[ -z "$pri" ]] && { echo "生成 privateKey 失败"; exit 1; }
 
-  pub="$(xray x25519 -i "$pri" 2>/dev/null | awk -F': ' '/Public key|PublicKey|Password/ {print $2}' | head -n1 | tr -d '\r')"
+  pub="$(xray x25519 -i "$pri" 2>/dev/null | sed -n 's/^Password (PublicKey): //p; s/^Public key: //p; s/^PublicKey: //p' | head -n1 | tr -d '\r')"
   [[ -z "$pub" ]] && { echo "推导 publicKey 失败"; exit 1; }
 
   echo "$pri|$pub"
@@ -82,9 +84,10 @@ get_public_ip() {
 choose_tcp_algo() {
   local available bbr_jitter cubic_jitter
   available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+
   if ! echo "$available" | grep -qw bbr; then
     echo "cubic"
-    return
+    return 0
   fi
 
   sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
@@ -100,12 +103,14 @@ choose_tcp_algo() {
   else
     echo "cubic"
   fi
+
+  return 0
 }
 
 write_sysctl() {
   local algo="$1"
 
-  cat >"$SYSCTL_CONF" <<EOF2
+  cat >"$SYSCTL_CONF" <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=$algo
 net.ipv4.tcp_fastopen=3
@@ -122,13 +127,15 @@ net.core.netdev_max_backlog=250000
 net.ipv4.tcp_max_syn_backlog=8192
 net.ipv4.tcp_fin_timeout=15
 net.ipv4.tcp_tw_reuse=1
-EOF2
+EOF
 
   sysctl --system >/dev/null || true
 
   local iface
   iface="$(ip route | awk '/default/ {print $5; exit}')"
   [[ -n "${iface:-}" ]] && tc qdisc replace dev "$iface" root fq >/dev/null 2>&1 || true
+
+  return 0
 }
 
 write_new_config() {
@@ -138,7 +145,7 @@ write_new_config() {
 
   mkdir -p /usr/local/etc/xray
 
-  cat >"$CONF" <<EOF2
+  cat >"$CONF" <<EOF
 {
   "log": {
     "loglevel": "warning"
@@ -181,11 +188,12 @@ write_new_config() {
     }
   ]
 }
-EOF2
+EOF
 
   ensure_conf_link
   systemctl enable xray >/dev/null 2>&1 || true
   systemctl restart xray
+  return 0
 }
 
 repair_config() {
@@ -211,6 +219,7 @@ inb=data["inbounds"][0]
 if inb.get("port") != 443:
     inb["port"]=443
     changed=True
+
 if inb.get("protocol") != "vless":
     inb["protocol"]="vless"
     changed=True
@@ -291,13 +300,13 @@ ensure_base_config() {
     uuid="$(new_uuid)"
     shortids_json="$(new_short_ids_json)"
     write_new_config "$uuid" "$pri" "$shortids_json"
-    return
+    return 0
   fi
 
   if repair_config; then
     :
   else
-    rc=$?
+    local rc=$?
     if [[ "$rc" -eq 2 || "$rc" -eq 3 ]]; then
       rm -f "$CONF"
       local algo keys pri uuid shortids_json
@@ -308,12 +317,13 @@ ensure_base_config() {
       uuid="$(new_uuid)"
       shortids_json="$(new_short_ids_json)"
       write_new_config "$uuid" "$pri" "$shortids_json"
-      return
+      return 0
     fi
   fi
 
   ensure_conf_link
   systemctl restart xray
+  return 0
 }
 
 get_short_id() {
@@ -358,14 +368,18 @@ build_link() {
   local name="$2"
   local flow="$3"
   local ip pbk sid
-  ip="$(get_public_ip)"
-  pbk="$(get_pbk)"
-  sid="$(get_short_id)"
 
-  [[ -z "$pbk" ]] && { echo "生成 pbk 失败"; return 1; }
-  [[ -z "$sid" ]] && { echo "shortId 缺失"; return 1; }
+  ip="$(get_public_ip)"
+  pbk="$(get_pbk || true)"
+  sid="$(get_short_id || true)"
+
+  [[ -n "$uuid" ]] || { echo "uuid 缺失"; return 1; }
+  [[ -n "$ip" ]] || { echo "公网IP 缺失"; return 1; }
+  [[ -n "$pbk" ]] || { echo "生成 pbk 失败"; return 1; }
+  [[ -n "$sid" ]] || { echo "shortId 缺失"; return 1; }
 
   echo "vless://${uuid}@${ip}:${PORT}?encryption=none&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${pbk}&sid=${sid}&flow=${flow}&type=tcp&headerType=none#${name}"
+  return 0
 }
 
 user_name_by_index() {
@@ -390,8 +404,10 @@ clients.insert(0, {"id": uuid, "flow": "xtls-rprx-vision", "email": "stream-main
 with open(conf,"w",encoding="utf-8") as f:
     json.dump(data,f,ensure_ascii=False,indent=2)
 PY
+
   ensure_conf_link
   systemctl restart xray
+  return 0
 }
 
 print_main_link() {
@@ -432,9 +448,10 @@ show_links() {
   while IFS='|' read -r idx name uuid flow; do
     [[ -z "$uuid" ]] && continue
     echo "[$idx] $name"
-    build_link "$uuid" "$name" "$flow"
+    build_link "$uuid" "$name" "$flow" || true
     echo
   done < <(list_users_raw)
+  return 0
 }
 
 show_user_index_list() {
@@ -444,6 +461,7 @@ show_user_index_list() {
     echo "  $idx. $name"
   done < <(list_users_raw)
   echo
+  return 0
 }
 
 add_user() {
@@ -472,8 +490,9 @@ PY
   systemctl restart xray
   echo
   echo "已新增用户: $name"
-  build_link "$uuid" "$name" "$FLOW"
+  build_link "$uuid" "$name" "$FLOW" || true
   echo
+  return 0
 }
 
 delete_user() {
@@ -507,6 +526,7 @@ PY
   ensure_conf_link
   systemctl restart xray
   echo "已删除用户: $name"
+  return 0
 }
 
 reset_user() {
@@ -547,8 +567,9 @@ PY
   systemctl restart xray
   echo
   echo "已重置用户: $name"
-  build_link "$uuid" "$name" "$FLOW"
+  build_link "$uuid" "$name" "$FLOW" || true
   echo
+  return 0
 }
 
 show_summary() {
@@ -569,21 +590,24 @@ PY
   echo "用户总数: $users"
   echo "shortId数量: $sid_count"
   echo "服务状态: $(systemctl is-active xray 2>/dev/null || true)"
+  return 0
 }
 
 run_doctor_menu() {
   [[ -x "$DOCTOR_REAL" ]] || { echo "诊断工具不存在"; return 1; }
   bash "$DOCTOR_REAL" doctor || { echo; echo "诊断执行失败"; return 1; }
+  return 0
 }
 
 run_watch() {
   [[ -x "$DOCTOR_REAL" ]] || { echo "诊断工具不存在"; return 1; }
   bash "$DOCTOR_REAL" watch || { echo; echo "实时监控执行失败"; return 1; }
+  return 0
 }
 
 menu_ui() {
   clear
-  cat <<EOF2
+  cat <<EOF
 ==============================
       CAST 直播管理菜单
 ==============================
@@ -598,12 +622,12 @@ menu_ui() {
 9. 实时监控
 0. 退出
 ==============================
-EOF2
+EOF
 
   read -rp "请选择: " choice
   case "$choice" in
     1) ensure_base_config; ensure_main_user; echo "配置已修复/初始化" ;;
-    2) print_main_link ;;
+    2) print_main_link || true ;;
     3) show_links ;;
     4) add_user ;;
     5) delete_user ;;
@@ -614,15 +638,16 @@ EOF2
     0) exit 0 ;;
     *) echo "无效选项" ;;
   esac
+  return 0
 }
 
 case "${1:-}" in
---bootstrap)
-  ensure_base_config
-  ensure_main_user
-  print_first_bootstrap || true
-  exit 0
-  ;;
+  --bootstrap)
+    ensure_base_config
+    ensure_main_user
+    print_first_bootstrap || true
+    exit 0
+    ;;
 esac
 
 while true; do
@@ -630,4 +655,3 @@ while true; do
   echo
   read -rp "按回车返回菜单..." _
 done
-EOF
