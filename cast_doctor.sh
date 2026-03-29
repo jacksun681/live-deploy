@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HISTORY_MAX=4
-RATE_SAMPLE_SECONDS=3
+CONF="/usr/local/etc/xray/config.json"
+PORT="443"
 
-declare -a UP_HISTORY=()
-declare -a DOWN_HISTORY=()
-declare -a STATUS_HISTORY=()
+PROBE_A_TARGET="8.8.8.8"
+PROBE_B_TARGET="1.1.1.1"
+PROBE_C_TARGET="223.5.5.5"
+
+HISTORY_MAX=6
+declare -a HISTORY_LABELS=()
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -20,192 +23,155 @@ need_cmd() {
 
 install_deps() {
   need_cmd curl curl
+  need_cmd jq jq
   need_cmd ping iputils-ping
   need_cmd ip iproute2
   need_cmd bc bc
   need_cmd awk gawk
-  need_cmd ss iproute2
-  need_cmd top procps
   need_cmd free procps
+  need_cmd top procps
+  need_cmd dig dnsutils
+  need_cmd ss iproute2
+  return 0
+}
+
+check_runtime_ready() {
+  [[ -f "$CONF" ]] || { echo "配置文件不存在"; return 1; }
+  command -v xray >/dev/null 2>&1 || { echo "xray 未安装"; return 1; }
   return 0
 }
 
 get_iface() {
   local iface
-  iface="$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1)"
+  iface="$(ip route get 8.8.8.8 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1)"
   [[ -z "${iface:-}" ]] && iface="$(ip -o -4 route show to default | awk '{print $5}' | head -n1)"
   echo "${iface:-eth0}"
 }
 
-bytes_to_mbps() {
-  awk -v b="$1" 'BEGIN{printf "%.2f", (b*8)/1000000}'
+cpu_usage() {
+  top -bn1 | awk -F'id,' '/Cpu\(s\)/ {
+    split($1,a,","); gsub(/ /,"",a[length(a)]);
+    if (a[length(a)] == "") print "0"; else printf("%.1f\n", 100-a[length(a)]);
+  }' | head -n1
 }
 
-read_net_bytes() {
-  local iface="$1"
-  local rx tx
-  rx="$(cat "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null || echo 0)"
-  tx="$(cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null || echo 0)"
-  echo "$rx $tx"
-}
-
-sample_rates() {
-  local iface="$1"
-  local sec="${2:-3}"
-  local rx1 tx1 rx2 tx2
-  read -r rx1 tx1 <<< "$(read_net_bytes "$iface")"
-  sleep "$sec"
-  read -r rx2 tx2 <<< "$(read_net_bytes "$iface")"
-
-  RX_BPS=$(((rx2-rx1)/sec))
-  TX_BPS=$(((tx2-tx1)/sec))
-  RX_MBPS="$(bytes_to_mbps "$RX_BPS")"
-  TX_MBPS="$(bytes_to_mbps "$TX_BPS")"
-}
-
-push_hist() {
-  local arr_name="$1"
-  local value="$2"
-  eval "$arr_name+=(\"$value\")"
-  eval "local len=\${#$arr_name[@]}"
-  if (( len > HISTORY_MAX )); then
-    eval "$arr_name=(\"\${$arr_name[@]:1}\")"
-  fi
-}
-
-avg_hist() {
-  local arr_name="$1"
-  eval "local vals=(\"\${$arr_name[@]}\")"
-  local joined="${vals[*]:-}"
-  awk -v s="$joined" 'BEGIN{
-    n=split(s,a," ");
-    if(n==0 || s==""){print "0.00"; exit}
-    sum=0;
-    for(i=1;i<=n;i++) sum+=a[i];
-    printf "%.2f", sum/n;
-  }'
-}
-
-ratio_safe() {
-  awk -v a="$1" -v b="$2" 'BEGIN{
-    if (b <= 0.01) {
-      if (a <= 0.01) printf "1.00";
-      else printf "999.00";
-    } else {
-      printf "%.2f", a/b;
-    }
-  }'
+mem_usage() {
+  free | awk '/Mem:/ {printf("%.1f\n",$3/$2*100)}'
 }
 
 conn_443_count() {
   ss -ant 2>/dev/null | awk '/:443 / || /:443$/ {c++} END{print c+0}'
 }
 
+dns_check() {
+  dig +short google.com >/dev/null 2>&1 && echo "ok" || echo "fail"
+}
+
+https_time() {
+  curl -o /dev/null -s --connect-timeout 3 --max-time 6 -w "%{time_total}" https://www.cloudflare.com || echo 9
+}
+
+https_ok() {
+  local t="$1"
+  awk -v x="$t" 'BEGIN{exit !(x<3.0)}' && echo "ok" || echo "fail"
+}
+
+ping_probe() {
+  local target="$1"
+  local count="${2:-3}"
+  local out loss avg jitter
+
+  out="$(ping -c "$count" -W 1 "$target" 2>/dev/null || true)"
+
+  loss="$(echo "$out" | awk -F',' '/packet loss/ {
+    gsub(/^ +| +$/, "", $3)
+    sub(/% packet loss/, "", $3)
+    print $3
+  }')"
+  avg="$(echo "$out" | awk -F'/' '/^rtt|^round-trip/ {print $5}')"
+  jitter="$(echo "$out" | awk -F'/' '/^rtt|^round-trip/ {print $7}')"
+
+  [[ -z "${loss:-}" ]] && loss="100"
+  [[ -z "${avg:-}" ]] && avg="0"
+  [[ -z "${jitter:-}" ]] && jitter="0"
+
+  echo "${avg} ${jitter} ${loss}"
+}
+
+tx_delta() {
+  local iface="$1" tx1 tx2
+  tx1="$(cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null || echo 0)"
+  sleep 1
+  tx2="$(cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null || echo 0)"
+  echo "$((tx2-tx1))"
+}
+
 tcp_retrans_count() {
   ss -ti 2>/dev/null | grep -c retrans || true
 }
 
-xray_status() {
-  systemctl is-active xray 2>/dev/null || echo unknown
+top_two_causes() {
+  printf "%s\n" \
+    "service ${SCORE_SERVICE}" \
+    "resource ${SCORE_RESOURCE}" \
+    "exit ${SCORE_EXIT}" \
+    "link ${SCORE_LINK}" \
+    "access ${SCORE_ACCESS}" \
+    "device ${SCORE_DEVICE}" \
+    "platform ${SCORE_PLATFORM}" \
+    | sort -k2 -nr
 }
 
-cpu_usage() {
-  top -bn1 | awk -F'id,' '/Cpu\(s\)/ {
-    split($1,a,","); gsub(/ /,"",a[length(a)]);
-    if (a[length(a)] == "") print "0"; else printf "%.1f", 100-a[length(a)];
-  }' | head -n1
+reason_text() {
+  case "$1" in
+    service) echo "节点服务异常" ;;
+    resource) echo "节点资源不足" ;;
+    exit) echo "节点出口异常" ;;
+    link) echo "节点链路波动" ;;
+    access) echo "本地网络不稳定（Wi-Fi/蜂窝）" ;;
+    device) echo "设备性能或编码问题" ;;
+    platform) echo "平台侧波动" ;;
+    *) echo "未识别" ;;
+  esac
 }
 
-mem_usage() {
-  free | awk '/Mem:/ {printf "%.1f",$3/$2*100}'
+severity_text() {
+  case "$1" in
+    0|1) echo "正常" ;;
+    2) echo "轻微" ;;
+    3) echo "中等" ;;
+    *) echo "严重" ;;
+  esac
 }
 
-https_time() {
-  curl -o /dev/null -s --connect-timeout 3 --max-time 5 -w "%{time_total}" "$1" || echo 9
-}
-
-ping_stats() {
-  local host="$1"
-  local out avg jit loss
-  out="$(ping -c 2 -W 1 "$host" 2>/dev/null || true)"
-  avg="$(echo "$out" | awk -F'/' '/^rtt|^round-trip/ {print $5}')"
-  jit="$(echo "$out" | awk -F'/' '/^rtt|^round-trip/ {print $7}')"
-  loss="$(echo "$out" | awk -F',' '/packet loss/ {gsub(/^ +| +$/, "", $3); sub(/% packet loss/, "", $3); print $3}')"
-  [[ -z "${avg:-}" ]] && avg="0"
-  [[ -z "${jit:-}" ]] && jit="0"
-  [[ -z "${loss:-}" ]] && loss="100"
-  echo "$avg $jit $loss"
-}
-
-detect_live_state() {
-  AVG_TX="$(avg_hist UP_HISTORY)"
-  AVG_RX="$(avg_hist DOWN_HISTORY)"
-  UP_DOWN_RATIO="$(ratio_safe "$AVG_TX" "$AVG_RX")"
-
-  LIVE_STATE="空闲联网"
-  LIVE_REASON="未见持续上传特征"
-
-  if (( CONN <= 0 )) && awk -v tx="$AVG_TX" 'BEGIN{exit !(tx<0.05)}'; then
-    LIVE_STATE="未检测到直播"
-    LIVE_REASON="无明显连接，且上行极低"
-    return
-  fi
-
-  if awk -v tx="$AVG_TX" -v rx="$AVG_RX" 'BEGIN{exit !(tx<0.10 && rx<0.30)}'; then
-    LIVE_STATE="空闲联网"
-    LIVE_REASON="仅有少量联网活动"
-    return
-  fi
-
-  if awk -v tx="$AVG_TX" -v rx="$AVG_RX" -v ratio="$UP_DOWN_RATIO" 'BEGIN{exit !(rx>1.0 && ratio<0.40)}'; then
-    LIVE_STATE="下行为主"
-    LIVE_REASON="下载明显高于上传，更像观看/浏览"
-    return
-  fi
-
-  if awk -v tx="$AVG_TX" -v ratio="$UP_DOWN_RATIO" 'BEGIN{exit !(tx>0.25 && ratio>1.20)}'; then
-    LIVE_STATE="疑似推流中"
-    LIVE_REASON="上行已明显增强"
-  fi
-
-  if awk -v tx="$AVG_TX" -v ratio="$UP_DOWN_RATIO" -v c="$CONN" 'BEGIN{exit !(tx>0.60 && ratio>1.40 && c>0)}'; then
-    LIVE_STATE="持续推流中"
-    LIVE_REASON="上行连续且主导，符合直播推流特征"
+confidence_text() {
+  local top="$1"
+  local second="$2"
+  local gap=$((top-second))
+  if (( top >= 80 || gap >= 40 )); then
+    echo "高"
+  elif (( top >= 40 || gap >= 15 )); then
+    echo "中"
+  else
+    echo "低"
   fi
 }
 
 status_label() {
-  if [[ "$XRAY" != "active" ]]; then
+  if (( SCORE_SERVICE >= 100 )); then
     echo "异常"
-    return
-  fi
-
-  if [[ "$LIVE_STATE" == "未检测到直播" || "$LIVE_STATE" == "空闲联网" || "$LIVE_STATE" == "下行为主" ]]; then
-    echo "非直播状态"
-    return
-  fi
-
-  if [[ "$TT_OK" != "ok" && "$PUB_OK" == "ok" ]]; then
+  elif (( SCORE_EXIT >= 60 || SCORE_RESOURCE >= 60 || SCORE_LINK >= 60 )); then
     echo "异常"
-    return
-  fi
-
-  if awk -v c="$CPU" -v m="$MEM" 'BEGIN{exit !(c>=90 || m>=90)}'; then
-    echo "异常"
-    return
-  fi
-
-  if awk -v j1="$PUB_JIT" -v j2="$TT_JIT" -v l1="$PUB_LOSS" -v l2="$TT_LOSS" 'BEGIN{exit !((j1>25 || j2>25 || l1>3 || l2>3))}'; then
+  elif (( SCORE_ACCESS >= 30 || SCORE_DEVICE >= 25 || SCORE_LINK >= 30 )); then
     echo "波动"
-    return
+  else
+    echo "正常"
   fi
-
-  echo "正常"
 }
 
 trend_label() {
   local normal=0 wave=0 bad=0 item
-  for item in "${STATUS_HISTORY[@]}"; do
+  for item in "${HISTORY_LABELS[@]}"; do
     case "$item" in
       正常) normal=$((normal+1)) ;;
       波动) wave=$((wave+1)) ;;
@@ -213,124 +179,188 @@ trend_label() {
     esac
   done
 
-  if (( bad >= 3 )); then
+  if (( bad >= 4 )); then
     echo "持续异常"
-  elif (( bad + wave >= 2 )); then
+  elif (( bad + wave >= 3 )); then
     echo "偶发波动"
   else
     echo "整体稳定"
   fi
 }
 
-ai_judge() {
-  MAIN_CAUSE="未发现明显异常"
-  SUB_CAUSE="无"
-  CONF="高"
-  CONCLUSION="当前链路整体正常。"
+push_history() {
+  HISTORY_LABELS+=("$1")
+  if ((${#HISTORY_LABELS[@]} > HISTORY_MAX)); then
+    HISTORY_LABELS=("${HISTORY_LABELS[@]:1}")
+  fi
+}
+
+collect_data() {
+  XRAY_STATUS="$(systemctl is-active xray 2>/dev/null || echo unknown)"
+  IFACE="$(get_iface)"
+  CPU="$(cpu_usage)"
+  MEM="$(mem_usage)"
+  CONN="$(conn_443_count)"
+  TX_DELTA="$(tx_delta "$IFACE")"
+  RETRANS="$(tcp_retrans_count)"
+  DNS_STATE="$(dns_check)"
+  HTTPS_TIME="$(https_time)"
+  HTTPS_STATE="$(https_ok "$HTTPS_TIME")"
+
+  read A_AVG A_JIT A_LOSS <<< "$(ping_probe "$PROBE_A_TARGET" 3)"
+  read B_AVG B_JIT B_LOSS <<< "$(ping_probe "$PROBE_B_TARGET" 3)"
+  read C_AVG C_JIT C_LOSS <<< "$(ping_probe "$PROBE_C_TARGET" 3)"
+}
+
+analyze() {
+  SCORE_SERVICE=0
+  SCORE_RESOURCE=0
+  SCORE_EXIT=0
+  SCORE_LINK=0
+  SCORE_ACCESS=0
+  SCORE_DEVICE=0
+  SCORE_PLATFORM=0
+
+  if [[ "$XRAY_STATUS" != "active" ]]; then
+    SCORE_SERVICE=100
+  fi
+
+  awk -v x="$CPU" 'BEGIN{exit !(x>=90)}' && SCORE_RESOURCE=$((SCORE_RESOURCE+45))
+  awk -v x="$MEM" 'BEGIN{exit !(x>=90)}' && SCORE_RESOURCE=$((SCORE_RESOURCE+30))
+  awk -v x="$CPU" 'BEGIN{exit !(x>=80 && x<90)}' && SCORE_RESOURCE=$((SCORE_RESOURCE+15))
+  awk -v x="$MEM" 'BEGIN{exit !(x>=80 && x<90)}' && SCORE_RESOURCE=$((SCORE_RESOURCE+10))
+
+  [[ "$DNS_STATE" != "ok" ]] && SCORE_EXIT=$((SCORE_EXIT+35))
+  [[ "$HTTPS_STATE" != "ok" ]] && SCORE_EXIT=$((SCORE_EXIT+60))
+  awk -v x="$HTTPS_TIME" 'BEGIN{exit !(x>=1.5 && x<3.0)}' && SCORE_EXIT=$((SCORE_EXIT+20))
+
+  awk -v x="$A_JIT" 'BEGIN{exit !(x>40)}' && SCORE_LINK=$((SCORE_LINK+20))
+  awk -v x="$B_JIT" 'BEGIN{exit !(x>40)}' && SCORE_LINK=$((SCORE_LINK+20))
+  awk -v x="$C_JIT" 'BEGIN{exit !(x>40)}' && SCORE_LINK=$((SCORE_LINK+15))
+  awk -v x="$A_LOSS" 'BEGIN{exit !(x>5)}' && SCORE_LINK=$((SCORE_LINK+20))
+  awk -v x="$B_LOSS" 'BEGIN{exit !(x>5)}' && SCORE_LINK=$((SCORE_LINK+20))
+  awk -v x="$C_LOSS" 'BEGIN{exit !(x>5)}' && SCORE_LINK=$((SCORE_LINK+15))
+  awk -v x="$A_AVG" 'BEGIN{exit !(x>150)}' && SCORE_LINK=$((SCORE_LINK+10))
+  awk -v x="$B_AVG" 'BEGIN{exit !(x>150)}' && SCORE_LINK=$((SCORE_LINK+10))
+  awk -v x="$C_AVG" 'BEGIN{exit !(x>120)}' && SCORE_LINK=$((SCORE_LINK+8))
+
+  awk -v x="$RETRANS" 'BEGIN{exit !(x>5)}' && SCORE_ACCESS=$((SCORE_ACCESS+35))
+  awk -v x="$TX_DELTA" -v c="$CONN" 'BEGIN{exit !(c>0 && x<2000)}' && SCORE_ACCESS=$((SCORE_ACCESS+25))
+  awk -v aj="$A_JIT" -v bj="$B_JIT" -v cj="$C_JIT" 'BEGIN{exit !((aj>50||bj>50||cj>50) && (aj<120 && bj<120 && cj<120))}' \
+    && SCORE_ACCESS=$((SCORE_ACCESS+15))
+
+  if (( SCORE_SERVICE == 0 && SCORE_RESOURCE < 20 && SCORE_EXIT < 20 && SCORE_LINK < 20 )); then
+    awk -v x="$TX_DELTA" -v c="$CONN" 'BEGIN{exit !(c>0 && x<1500)}' && SCORE_DEVICE=$((SCORE_DEVICE+30))
+  fi
+
+  if (( SCORE_SERVICE == 0 && SCORE_RESOURCE < 20 && SCORE_EXIT < 20 && SCORE_LINK < 20 && SCORE_ACCESS < 20 && SCORE_DEVICE < 20 )); then
+    SCORE_PLATFORM=25
+  fi
+
+  local sorted
+  sorted="$(top_two_causes)"
+  TOP1_NAME="$(echo "$sorted" | sed -n '1p' | awk '{print $1}')"
+  TOP1_SCORE="$(echo "$sorted" | sed -n '1p' | awk '{print $2}')"
+  TOP2_NAME="$(echo "$sorted" | sed -n '2p' | awk '{print $1}')"
+  TOP2_SCORE="$(echo "$sorted" | sed -n '2p' | awk '{print $2}')"
+
+  CURRENT_STATUS="$(status_label)"
+  push_history "$CURRENT_STATUS"
+  TREND_STATUS="$(trend_label)"
+  CONFIDENCE="$(confidence_text "$TOP1_SCORE" "$TOP2_SCORE")"
+
+  SEVERITY_NUM=1
+  if [[ "$CURRENT_STATUS" == "波动" ]]; then
+    SEVERITY_NUM=2
+  fi
+  if [[ "$CURRENT_STATUS" == "异常" ]]; then
+    SEVERITY_NUM=3
+  fi
+  if (( TOP1_SCORE >= 80 )); then
+    SEVERITY_NUM=4
+  fi
+  SEVERITY_TEXT="$(severity_text "$SEVERITY_NUM")"
+
+  CONCLUSION="当前直播链路整体正常。"
   SUGGESTION="继续观察。"
 
-  if [[ "$LIVE_STATE" == "未检测到直播" || "$LIVE_STATE" == "空闲联网" ]]; then
-    MAIN_CAUSE="当前未在直播"
-    SUB_CAUSE="无"
-    CONF="高"
-    CONCLUSION="当前没有明显直播推流特征。"
-    SUGGESTION="若你刚开播，等几秒再看。"
-    return
-  fi
-
-  if [[ "$LIVE_STATE" == "下行为主" ]]; then
-    MAIN_CAUSE="非推流状态（更像观看/浏览）"
-    SUB_CAUSE="无"
-    CONF="高"
-    CONCLUSION="当前流量以下行为主，不像开直播。"
-    SUGGESTION="若你在看视频，这是正常现象。"
-    return
-  fi
-
-  if [[ "$XRAY" != "active" ]]; then
-    MAIN_CAUSE="节点服务异常"
-    SUB_CAUSE="无"
-    CONF="高"
-    CONCLUSION="当前异常更像节点服务层故障。"
-    SUGGESTION="优先修复 Xray/端口监听。"
-    return
-  fi
-
-  if [[ "$TT_OK" != "ok" && "$PUB_OK" == "ok" ]]; then
-    MAIN_CAUSE="TikTok入口路径异常"
-    SUB_CAUSE="节点出口异常"
-    CONF="高"
-    CONCLUSION="当前异常更集中在 TikTok 方向。"
-    SUGGESTION="优先切换节点或更换适合 TikTok 的线路。"
-    return
-  fi
-
-  if awk -v c="$CPU" -v m="$MEM" 'BEGIN{exit !(c>=90 || m>=90)}'; then
-    MAIN_CAUSE="节点资源不足"
-    SUB_CAUSE="无"
-    CONF="高"
-    CONCLUSION="当前更像节点资源层问题。"
-    SUGGESTION="降低负载，或升级节点配置。"
-    return
-  fi
-
-  if awk -v r="$RETRANS" 'BEGIN{exit !(r>5)}'; then
-    MAIN_CAUSE="本地网络不稳定（Wi-Fi/蜂窝）"
-    SUB_CAUSE="设备性能或编码问题"
-    CONF="中"
-    CONCLUSION="当前更像接入层不稳，而不是节点本身故障。"
-    SUGGESTION="优先检查 Wi-Fi/蜂窝、信号、干扰和手机状态。"
-    return
-  fi
-
-  if awk -v j1="$PUB_JIT" -v j2="$TT_JIT" -v l1="$PUB_LOSS" -v l2="$TT_LOSS" 'BEGIN{exit !((j1>25 || j2>25 || l1>3 || l2>3))}'; then
-    MAIN_CAUSE="链路层波动"
-    SUB_CAUSE="本地网络不稳定（Wi-Fi/蜂窝）"
-    CONF="中"
-    CONCLUSION="当前更像链路层波动。"
-    SUGGESTION="继续观察 1~2 分钟；若持续，建议切节点。"
-    return
-  fi
-
-  if [[ "$TT_OK" == "ok" && "$PUB_OK" == "ok" ]] && awk -v tx="$AVG_TX" 'BEGIN{exit !(tx<0.50)}'; then
-    MAIN_CAUSE="设备性能或编码问题"
-    SUB_CAUSE="平台侧波动"
-    CONF="中"
-    CONCLUSION="当前未发现明显节点异常，更像设备侧问题。"
-    SUGGESTION="关注手机发热、后台、码率和分辨率。"
-    return
-  fi
-
-  MAIN_CAUSE="平台侧波动"
-  SUB_CAUSE="设备性能或编码问题"
-  CONF="低"
-  CONCLUSION="当前未发现足以解释异常的节点侧证据。"
-  SUGGESTION="继续观察；如多个节点同样异常，更偏向平台问题。"
+  case "$TOP1_NAME" in
+    service)
+      CONCLUSION="当前异常更像节点服务层故障。"
+      SUGGESTION="优先修复 Xray/端口监听，不建议继续直播。"
+      ;;
+    resource)
+      CONCLUSION="当前异常更像节点资源不足。"
+      SUGGESTION="降低负载或升级节点配置。"
+      ;;
+    exit)
+      CONCLUSION="当前异常更像节点出口层不稳。"
+      SUGGESTION="优先观察 HTTPS 出口，必要时切节点。"
+      ;;
+    link)
+      CONCLUSION="当前异常更像链路层波动。"
+      SUGGESTION="继续观察 1~2 分钟；若持续，建议切节点。"
+      ;;
+    access)
+      CONCLUSION="当前异常更像本地接入层不稳。"
+      SUGGESTION="优先排查 Wi-Fi/蜂窝信号与本地网络环境。"
+      ;;
+    device)
+      CONCLUSION="当前未见明显节点异常，更像设备侧性能或编码问题。"
+      SUGGESTION="关注手机发热、后台、码率和分辨率。"
+      ;;
+    platform)
+      CONCLUSION="当前未见明显节点或链路异常，可能为平台侧波动。"
+      SUGGESTION="继续观察；如多节点同样异常，再偏向平台问题。"
+      ;;
+  esac
 }
 
 render() {
   clear
   echo "=============================="
-  echo "   TikTok 直播诊断（AI增强）"
+  echo "      直播诊断（实时）"
   echo "=============================="
-  echo "直播状态：$LIVE_STATE"
-  echo "当前状态：$CURRENT_STATUS  |  趋势：$TREND_STATUS"
-  echo "主因：$MAIN_CAUSE"
-  echo "备因：$SUB_CAUSE  |  置信度：$CONF"
   echo
-  echo "上行：$TX_MBPS Mbps  下行：$RX_MBPS Mbps  比值：$UP_DOWN_RATIO"
-  echo "均上：$AVG_TX Mbps  均下：$AVG_RX Mbps  连接：$CONN  重传：$RETRANS"
-  echo "TikTok：$TT_LAT ms / $TT_JIT ms / $TT_LOSS% / HTTPS $TT_TIME s"
-  echo "公共：  $PUB_LAT ms / $PUB_JIT ms / $PUB_LOSS% / HTTPS $PUB_TIME s"
+  echo "时间: $(date '+%F %T')"
   echo
-  echo "结论：$CONCLUSION"
-  echo "建议：$SUGGESTION"
+  echo "当前状态: ${CURRENT_STATUS}"
+  echo "趋势判断: ${TREND_STATUS}"
+  echo "严重程度: ${SEVERITY_TEXT}"
   echo
-  echo "q 回车返回菜单，Ctrl+C退出"
+  echo "最可能原因: $(reason_text "$TOP1_NAME")"
+  echo "备选原因:   $(reason_text "$TOP2_NAME")"
+  echo "置信度:     ${CONFIDENCE}"
+  echo
+  echo "------------------------------"
+  echo "关键数据"
+  echo "------------------------------"
+  echo "Xray:   ${XRAY_STATUS}"
+  echo "CPU:    ${CPU}%"
+  echo "内存:   ${MEM}%"
+  echo "连接:   ${CONN}"
+  echo "发送:   ${TX_DELTA} B/s"
+  echo "重传:   ${RETRANS}"
+  echo "DNS:    ${DNS_STATE}"
+  echo "HTTPS:  ${HTTPS_STATE} (${HTTPS_TIME}s)"
+  echo
+  echo "探针A:  ${A_AVG}ms / jitter ${A_JIT}ms / loss ${A_LOSS}%"
+  echo "探针B:  ${B_AVG}ms / jitter ${B_JIT}ms / loss ${B_LOSS}%"
+  echo "探针C:  ${C_AVG}ms / jitter ${C_JIT}ms / loss ${C_LOSS}%"
+  echo
+  echo "------------------------------"
+  echo "结论"
+  echo "------------------------------"
+  echo "${CONCLUSION}"
+  echo
+  echo "建议: ${SUGGESTION}"
+  echo
+  echo "q 回车返回管理菜单，Ctrl+C 退出到命令行"
 }
 
 diagnose_loop() {
   install_deps
+  check_runtime_ready || true
 
   local stop_flag=0
   trap 'stop_flag=1' INT
@@ -338,40 +368,12 @@ diagnose_loop() {
   while true; do
     [[ "$stop_flag" -eq 1 ]] && break
 
-    local iface
-    iface="$(get_iface)"
-
-    XRAY="$(xray_status)"
-    CPU="$(cpu_usage)"
-    MEM="$(mem_usage)"
-    CONN="$(conn_443_count)"
-    RETRANS="$(tcp_retrans_count)"
-
-    sample_rates "$iface" "$RATE_SAMPLE_SECONDS"
-    push_hist UP_HISTORY "$TX_MBPS"
-    push_hist DOWN_HISTORY "$RX_MBPS"
-
-    detect_live_state
-
-    read PUB_LAT PUB_JIT PUB_LOSS <<< "$(ping_stats 1.1.1.1)"
-    PUB_TIME="$(https_time https://www.cloudflare.com)"
-    PUB_OK="fail"
-    awk -v x="$PUB_TIME" 'BEGIN{exit !(x<3.0)}' && PUB_OK="ok"
-
-    read TT_LAT TT_JIT TT_LOSS <<< "$(ping_stats www.tiktok.com)"
-    TT_TIME="$(https_time https://www.tiktok.com)"
-    TT_OK="fail"
-    awk -v x="$TT_TIME" 'BEGIN{exit !(x<3.0)}' && TT_OK="ok"
-
-    CURRENT_STATUS="$(status_label)"
-    [[ "$CURRENT_STATUS" == "正常" || "$CURRENT_STATUS" == "波动" || "$CURRENT_STATUS" == "异常" ]] && push_hist STATUS_HISTORY "$CURRENT_STATUS"
-    TREND_STATUS="$(trend_label)"
-
-    ai_judge
+    collect_data
+    analyze
     render
 
     echo
-    read -r -t 2 -p "输入 q 回车返回管理菜单，或等待自动刷新: " key || key=""
+    read -r -t 3 -p "输入 q 回车返回管理菜单，或等待自动刷新: " key || key=""
     case "$key" in
       q|Q)
         trap - INT
@@ -402,4 +404,3 @@ main() {
 }
 
 main "$@"
-EOF
