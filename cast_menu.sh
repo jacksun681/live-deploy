@@ -599,8 +599,8 @@ case "${1:-}" in
 esac
 
 while true; do
-  menu_ui
-  rc=$?
+  rc=0
+  menu_ui || rc=$?
   if [[ "$rc" -eq 10 ]]; then
     continue
   fi
