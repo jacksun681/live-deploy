@@ -103,7 +103,6 @@ choose_tcp_algo() {
   else
     echo "cubic"
   fi
-
   return 0
 }
 
@@ -134,7 +133,6 @@ EOF
   local iface
   iface="$(ip route | awk '/default/ {print $5; exit}')"
   [[ -n "${iface:-}" ]] && tc qdisc replace dev "$iface" root fq >/dev/null 2>&1 || true
-
   return 0
 }
 
@@ -219,7 +217,6 @@ inb=data["inbounds"][0]
 if inb.get("port") != 443:
     inb["port"]=443
     changed=True
-
 if inb.get("protocol") != "vless":
     inb["protocol"]="vless"
     changed=True
@@ -346,7 +343,6 @@ print(data["inbounds"][0]["streamSettings"]["realitySettings"].get("privateKey",
 PY
 )"
   [[ -z "$pri" ]] && return 1
-
   xray x25519 -i "$pri" 2>/dev/null \
     | sed -n 's/^Password (PublicKey): //p; s/^Public key: //p; s/^PublicKey: //p' \
     | head -n1 | tr -d '\r'
@@ -382,6 +378,18 @@ build_link() {
   return 0
 }
 
+show_links() {
+  ensure_base_config
+  ensure_main_user
+  while IFS='|' read -r idx name uuid flow; do
+    [[ -z "$uuid" ]] && continue
+    echo "[$idx] $name"
+    build_link "$uuid" "$name" "$flow" || true
+    echo
+  done < <(list_users_raw)
+  return 0
+}
+
 user_name_by_index() {
   local idx="$1"
   list_users_raw | awk -F'|' -v i="$idx" '$1==i{print $2}'
@@ -410,56 +418,12 @@ PY
   return 0
 }
 
-print_main_link() {
-  ensure_base_config
-  ensure_main_user
-
-  local link=""
-  while IFS='|' read -r idx name uuid flow; do
-    [[ "$name" == "$MAIN_USER" ]] || continue
-    link="$(build_link "$uuid" "$name" "$flow" || true)"
-    [[ -n "$link" ]] || { echo "生成主链接失败"; return 1; }
-    echo "$link"
-    return 0
-  done < <(list_users_raw)
-
-  echo "未找到主用户"
-  return 1
-}
-
 print_first_bootstrap() {
   echo
   echo "====== CAST 部署完成 ======"
   echo
-
-  if ! print_main_link; then
-    echo "主链接输出失败"
-    return 1
-  fi
-
-  echo
+  show_links
   echo "管理命令: cast"
-  echo
-  return 0
-}
-
-show_links() {
-  ensure_base_config
-  while IFS='|' read -r idx name uuid flow; do
-    [[ -z "$uuid" ]] && continue
-    echo "[$idx] $name"
-    build_link "$uuid" "$name" "$flow" || true
-    echo
-  done < <(list_users_raw)
-  return 0
-}
-
-show_user_index_list() {
-  echo "当前用户列表："
-  while IFS='|' read -r idx name uuid flow; do
-    [[ -z "$uuid" ]] && continue
-    echo "  $idx. $name"
-  done < <(list_users_raw)
   echo
   return 0
 }
@@ -497,7 +461,12 @@ PY
 
 delete_user() {
   ensure_base_config
-  show_user_index_list
+  echo "当前用户列表："
+  while IFS='|' read -r idx name uuid flow; do
+    [[ -z "$uuid" ]] && continue
+    echo "  $idx. $name"
+  done < <(list_users_raw)
+  echo
 
   local idx name
   read -rp "请输入要删除的用户序号: " idx
@@ -531,7 +500,12 @@ PY
 
 reset_user() {
   ensure_base_config
-  show_user_index_list
+  echo "当前用户列表："
+  while IFS='|' read -r idx name uuid flow; do
+    [[ -z "$uuid" ]] && continue
+    echo "  $idx. $name"
+  done < <(list_users_raw)
+  echo
 
   local idx name uuid
   read -rp "请输入要重置的用户序号: " idx
@@ -577,7 +551,7 @@ run_diagnose() {
   bash "$DOCTOR_REAL" diagnose
   local rc=$?
   [[ "$rc" -eq 99 ]] && exit 0
-  return 0
+  return 10
 }
 
 menu_ui() {
@@ -587,12 +561,11 @@ menu_ui() {
       CAST 直播管理菜单
 ==============================
 1. 修复/初始化
-2. 查看主链接
-3. 查看全部链接
-4. 新增用户
-5. 删除用户
-6. 重置用户
-7. 直播诊断
+2. 查看链接
+3. 新增用户
+4. 删除用户
+5. 重置用户
+6. 直播诊断
 0. 退出
 ==============================
 EOF
@@ -600,12 +573,11 @@ EOF
   read -rp "请选择: " choice
   case "$choice" in
     1) ensure_base_config; ensure_main_user; echo "配置已修复/初始化" ;;
-    2) print_main_link || true ;;
-    3) show_links ;;
-    4) add_user ;;
-    5) delete_user ;;
-    6) reset_user ;;
-    7) run_diagnose; return 10 ;;
+    2) show_links ;;
+    3) add_user ;;
+    4) delete_user ;;
+    5) reset_user ;;
+    6) run_diagnose ;;
     0) exit 0 ;;
     *) echo "无效选项" ;;
   esac
@@ -616,7 +588,7 @@ case "${1:-}" in
   --bootstrap)
     ensure_base_config
     ensure_main_user
-    print_first_bootstrap || true
+    print_first_bootstrap
     exit 0
     ;;
 esac
