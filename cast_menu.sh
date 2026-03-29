@@ -550,7 +550,9 @@ run_diagnose() {
   [[ -x "$DOCTOR_REAL" ]] || { echo "诊断工具不存在"; return 1; }
   bash "$DOCTOR_REAL" diagnose
   local rc=$?
-  [[ "$rc" -eq 99 ]] && exit 0
+  if [[ "$rc" -eq 99 ]]; then
+    exit 0
+  fi
   return 10
 }
 
