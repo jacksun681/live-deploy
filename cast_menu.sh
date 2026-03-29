@@ -572,38 +572,9 @@ PY
   return 0
 }
 
-show_summary() {
-  ensure_base_config
-  local ip users sid_count
-  ip="$(get_public_ip)"
-  users="$(list_users_raw | wc -l | awk '{print $1}')"
-  sid_count="$(python3 - <<'PY'
-import json
-with open("/usr/local/etc/xray/config.json","r",encoding="utf-8") as f:
-    data=json.load(f)
-print(len(data["inbounds"][0]["streamSettings"]["realitySettings"].get("shortIds", [])))
-PY
-)"
-  echo "节点IP: $ip"
-  echo "端口: $PORT"
-  echo "主用户: $MAIN_USER"
-  echo "用户总数: $users"
-  echo "shortId数量: $sid_count"
-  echo "服务状态: $(systemctl is-active xray 2>/dev/null || true)"
-  return 0
-}
-
-run_watch() {
+run_diagnose() {
   [[ -x "$DOCTOR_REAL" ]] || { echo "诊断工具不存在"; return 1; }
-  bash "$DOCTOR_REAL" watch
-  local rc=$?
-  [[ "$rc" -eq 99 ]] && exit 0
-  return 0
-}
-
-run_doctor_menu() {
-  [[ -x "$DOCTOR_REAL" ]] || { echo "诊断工具不存在"; return 1; }
-  bash "$DOCTOR_REAL" doctor
+  bash "$DOCTOR_REAL" diagnose
   local rc=$?
   [[ "$rc" -eq 99 ]] && exit 0
   return 0
@@ -621,9 +592,7 @@ menu_ui() {
 4. 新增用户
 5. 删除用户
 6. 重置用户
-7. 节点状态
-8. 实时监控
-9. 诊断菜单
+7. 直播诊断
 0. 退出
 ==============================
 EOF
@@ -636,9 +605,7 @@ EOF
     4) add_user ;;
     5) delete_user ;;
     6) reset_user ;;
-    7) show_summary ;;
-    8) run_watch ;;
-    9) run_doctor_menu ;;
+    7) run_diagnose; return 10 ;;
     0) exit 0 ;;
     *) echo "无效选项" ;;
   esac
@@ -656,6 +623,10 @@ esac
 
 while true; do
   menu_ui
+  rc=$?
+  if [[ "$rc" -eq 10 ]]; then
+    continue
+  fi
   echo
   read -rp "按回车返回菜单..." _
 done
