@@ -553,6 +553,9 @@ run_diagnose() {
   if [[ "$rc" -eq 99 ]]; then
     exit 0
   fi
+  if [[ "$rc" -eq 88 ]]; then
+    return 10
+  fi
   return 10
 }
 
