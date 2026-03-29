@@ -438,21 +438,27 @@ ai_judge() {
 
 render() {
   clear
-  echo "=============================="
-  echo "   TikTok 直播诊断（AI增强）"
-  echo "=============================="
+  echo "====== TikTok直播诊断 ======"
+  echo
   echo "直播状态：$LIVE_STATE"
-  echo "状态：$CURRENT_STATUS   趋势：$TREND_STATUS"
+  echo "当前状态：$CURRENT_STATUS   趋势：$TREND_STATUS"
   echo "主因：$MAIN_CAUSE"
-  echo "备因：$SUB_CAUSE   置信度：$CONF"
-  echo
-  echo "上行：$TX_MBPS Mbps   下行：$RX_MBPS Mbps   比值：$UP_DOWN_RATIO"
-  echo "均上：$AVG_TX Mbps   均下：$AVG_RX Mbps   连接：$CONN   重传：$RETRANS"
-  echo "TikTok：$TT_LAT/$TT_JIT/$TT_LOSS   HTTPS $TT_TIME s"
-  echo "公共：  $PUB_LAT/$PUB_JIT/$PUB_LOSS   HTTPS $PUB_TIME s"
-  echo
   echo "结论：$CONCLUSION"
   echo "建议：$SUGGESTION"
+  echo
+  echo "----------- 流量 -----------"
+  printf "上行：%6s Mbps\n" "$TX_MBPS"
+  printf "下行：%6s Mbps\n" "$RX_MBPS"
+  printf "均上：%6s Mbps\n" "$AVG_TX"
+  printf "均下：%6s Mbps\n" "$AVG_RX"
+  echo "连接：$CONN"
+  echo "重传：$RETRANS"
+  echo
+  echo "-------- 网络质量 --------"
+  echo "TikTok：$TT_LAT ms / $TT_JIT ms / $TT_LOSS% / $TT_TIME s"
+  echo "公共：  $PUB_LAT ms / $PUB_JIT ms / $PUB_LOSS% / $PUB_TIME s"
+  echo
+  echo "置信度：$CONF"
   echo
   echo "q 回车返回菜单，Ctrl+C退出"
 }
@@ -507,7 +513,7 @@ diagnose_loop() {
         trap - INT
         echo
         echo "已结束直播诊断，返回管理菜单。"
-        return 0
+        exit 88
         ;;
     esac
   done
@@ -515,7 +521,7 @@ diagnose_loop() {
   trap - INT
   echo
   echo "已结束直播诊断，退出到命令行。"
-  return 99
+  exit 99
 }
 
 main() {
