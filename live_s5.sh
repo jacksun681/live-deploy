@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+垃圾桶#!/usr/bin/env bash
 set -euo pipefail
 
 CONF="/etc/danted.conf"
@@ -42,9 +42,9 @@ get_service_name() {
   echo "danted"
 }
 
-svc_enable()  { systemctl enable "$(get_service_name)" >/dev/null 2>&1 || true; }
-svc_start()   { systemctl start  "$(get_service_name)"; }
-svc_stop()    { systemctl stop   "$(get_service_name)"; }
+svc_enable()  { systemctl enable  "$(get_service_name)" >/dev/null 2>&1 || true; }
+svc_start()   { systemctl start   "$(get_service_name)"; }
+svc_stop()    { systemctl stop    "$(get_service_name)"; }
 svc_restart() { systemctl restart "$(get_service_name)"; }
 
 get_iface() {
@@ -145,147 +145,87 @@ EOF
   systemctl daemon-reload
 }
 
-user_exists() {
-  id "$1" >/dev/null 2>&1
-}
-
 ensure_user() {
-  local user="$1" pass="$2"
-
-  if ! user_exists "$user"; then
-    useradd -M -s /usr/sbin/nologin "$user"
+  if ! id "$DEFAULT_USER" >/dev/null 2>&1; then
+    useradd -M -s /usr/sbin/nologin "$DEFAULT_USER"
   fi
-
-  echo "${user}:${pass}" | chpasswd
+  echo "${DEFAULT_USER}:${DEFAULT_PASS}" | chpasswd
 }
 
-list_s5_users() {
-  awk -F: '
-    ($7=="/usr/sbin/nologin" || $7=="/usr/bin/nologin") &&
-    ($1=="zxwl123" || $1 ~ /^s5user[0-9]+$/) {print $1}
-  ' /etc/passwd
+open_port() {
+  local port
+  port="$(get_port)"
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+    ufw allow "${port}/udp" >/dev/null 2>&1 || true
+  fi
 }
 
-list_users() {
-  local users
-  users="$(list_s5_users || true)"
-  [[ -n "${users:-}" ]] || { echo "暂无用户"; return; }
-  nl -w2 -s'. ' <(printf "%s\n" "$users")
+close_port() {
+  local port="$1"
+  if command -v ufw >/dev/null 2>&1; then
+    ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+    ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
+  fi
 }
 
-user_by_index() {
-  list_s5_users | sed -n "${1}p"
-}
-
-next_user_name() {
-  local n
-  n="$(list_s5_users | grep -E '^s5user[0-9]+$' | sed 's/s5user//' | sort -n | tail -n1)"
-  [[ -z "${n:-}" ]] && n=0
-  echo "s5user$((n+1))"
-}
-
-ensure_s5() {
-  install_deps
-  write_sysctl
-  write_conf
-  ensure_user "$DEFAULT_USER" "$DEFAULT_PASS"
-  write_service_override
-  svc_enable
-  svc_restart
-  echo "S5 已完成初始化/修复"
-}
-
-show_info() {
-  ensure_s5 >/dev/null 2>&1 || true
+print_info() {
   echo
   echo "$(get_ip)"
   echo "$(get_port)"
   echo "${DEFAULT_USER}"
   echo "${DEFAULT_PASS}"
   echo
-  list_users
-  echo
 }
 
-add_user() {
-  ensure_s5 >/dev/null 2>&1 || true
-  local user
-  user="$(next_user_name)"
-  ensure_user "$user" "$DEFAULT_PASS"
+generate_s5() {
+  install_deps
+  write_sysctl
+  write_conf
+  ensure_user
+  write_service_override
+  svc_enable
+  open_port
   svc_restart
-
-  echo
-  echo "$(get_ip)"
-  echo "$(get_port)"
-  echo "$user"
-  echo "${DEFAULT_PASS}"
-  echo
+  echo "S5 已生成完成"
+  print_info
 }
 
-delete_user() {
-  ensure_s5 >/dev/null 2>&1 || true
-  echo "当前用户:"
-  list_users
-  echo
-
-  local idx user
-  read -rp "请输入要删除的序号: " idx
-  [[ "$idx" =~ ^[0-9]+$ ]] || { echo "请输入数字序号"; return 1; }
-
-  user="$(user_by_index "$idx")"
-  [[ -n "${user:-}" ]] || { echo "序号无效"; return 1; }
-  [[ "$user" == "$DEFAULT_USER" ]] && { echo "默认账号不建议删除"; return 1; }
-
-  userdel "$user" >/dev/null 2>&1 || true
-  svc_restart
-  echo "已删除用户: $user"
+show_info() {
+  generate_s5 >/dev/null 2>&1 || true
+  print_info
 }
 
-reset_user_pass() {
-  ensure_s5 >/dev/null 2>&1 || true
-  echo "当前用户:"
-  list_users
-  echo
+change_port() {
+  generate_s5 >/dev/null 2>&1 || true
 
-  local idx user
-  read -rp "请输入要重置密码的序号: " idx
-  [[ "$idx" =~ ^[0-9]+$ ]] || { echo "请输入数字序号"; return 1; }
-
-  user="$(user_by_index "$idx")"
-  [[ -n "${user:-}" ]] || { echo "序号无效"; return 1; }
-
-  ensure_user "$user" "$DEFAULT_PASS"
-  svc_restart
-
-  echo
-  echo "$(get_ip)"
-  echo "$(get_port)"
-  echo "$user"
-  echo "${DEFAULT_PASS}"
-  echo
-}
-
-regen_port() {
-  ensure_s5 >/dev/null 2>&1 || true
+  local old_port new_port
+  old_port="$(get_port)"
   rm -f "$PORT_FILE"
 
-  local port
   while true; do
-    port=$((RANDOM % 50000 + 10000))
-    port_in_use "$port" || break
+    new_port=$((RANDOM % 50000 + 10000))
+    port_in_use "$new_port" || break
   done
 
-  echo "$port" > "$PORT_FILE"
+  echo "$new_port" > "$PORT_FILE"
   chmod 600 "$PORT_FILE"
+
   write_conf
+  close_port "$old_port"
+  open_port
   svc_restart
-  echo "已重新生成随机端口: $port"
+
+  echo "端口已修改，原端口已失效"
+  print_info
 }
 
 start_s5() {
-  ensure_s5 >/dev/null 2>&1 || true
+  generate_s5 >/dev/null 2>&1 || true
   svc_start
   echo "S5 已启动"
+  print_info
 }
 
 stop_s5() {
@@ -299,28 +239,22 @@ menu_ui() {
 ==============================
          S5 管理菜单
 ==============================
-1. 初始化 / 修复 S5
+1. 生成 S5
 2. 查看 S5 信息
-3. 新增用户
-4. 删除用户
-5. 重置密码
-6. 重新生成随机端口
-7. 启动 S5
-8. 停止 S5
+3. 修改端口
+4. 启动 S5
+5. 停止 S5
 0. 返回上级菜单
 ==============================
 EOF
 
   read -rp "请选择: " choice
   case "$choice" in
-    1) ensure_s5 ;;
+    1) generate_s5 ;;
     2) show_info ;;
-    3) add_user ;;
-    4) delete_user ;;
-    5) reset_user_pass ;;
-    6) regen_port ;;
-    7) start_s5 ;;
-    8) stop_s5 ;;
+    3) change_port ;;
+    4) start_s5 ;;
+    5) stop_s5 ;;
     0) exit 88 ;;
     *) echo "无效选项" ;;
   esac
