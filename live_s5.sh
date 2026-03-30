@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -u
 
 CONF="/etc/danted.conf"
 PORT_FILE="/etc/danted_port"
@@ -9,8 +9,20 @@ DEFAULT_USER="zxwl123"
 DEFAULT_PASS="zxwl123"
 MANUAL_STOP_FLAG="/tmp/s5_manual_stop"
 CHECK_SCRIPT="/usr/local/bin/s5-check.sh"
+SRC_DIR="/root/dante-1.4.2"
+SRC_TAR="/root/dante-1.4.2.tar.gz"
+SRC_URL="https://www.inet.no/dante/files/dante-1.4.2.tar.gz"
 
 [[ "$(id -u)" -ne 0 ]] && echo "请用 root 运行" && exit 1
+
+log() { echo "[S5] $*"; }
+fail() { echo "[S5] 失败: $*"; return 1; }
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  apt-get update -yq >/dev/null 2>&1 || true
+  apt-get install -yq "$2" >/dev/null 2>&1 || return 1
+}
 
 get_ip() {
   hostname -I | awk '{print $1}'
@@ -34,22 +46,46 @@ get_port() {
   [[ -f "$PORT_FILE" ]] && cat "$PORT_FILE" || echo "1080"
 }
 
+ensure_deps() {
+  need_cmd wget wget || return 1
+  need_cmd gcc gcc || return 1
+  need_cmd g++ g++ || true
+  need_cmd make make || return 1
+  need_cmd tar tar || return 1
+  need_cmd ss iproute2 || return 1
+  need_cmd useradd passwd || true
+  need_cmd chpasswd passwd || true
+  return 0
+}
+
 ensure_sockd() {
-  [[ -x "$SOCKD_BIN" ]] || {
-    echo "sockd 不存在: $SOCKD_BIN"
-    echo "请先确认 /usr/local/sbin/sockd 已安装可用"
-    exit 1
-  }
+  [[ -x "$SOCKD_BIN" ]] && return 0
+
+  ensure_deps || return 1
+
+  cd /root || return 1
+  rm -rf "$SRC_DIR" "$SRC_TAR"
+
+  wget -q "$SRC_URL" -O "$SRC_TAR" || return 1
+  tar -xzf "$SRC_TAR" || return 1
+  cd "$SRC_DIR" || return 1
+
+  ./configure CFLAGS="-Wno-error" >/tmp/dante-configure.log 2>&1 || return 1
+  make -j"$(nproc)" >/tmp/dante-make.log 2>&1 || return 1
+  make install >/tmp/dante-install.log 2>&1 || return 1
+
+  [[ -x "$SOCKD_BIN" ]] || return 1
+  return 0
 }
 
 ensure_user() {
-  useradd -M -s /usr/sbin/nologin "$DEFAULT_USER" 2>/dev/null || true
-  echo "${DEFAULT_USER}:${DEFAULT_PASS}" | chpasswd
+  useradd -M -s /usr/sbin/nologin "$DEFAULT_USER" >/dev/null 2>&1 || true
+  echo "${DEFAULT_USER}:${DEFAULT_PASS}" | chpasswd >/dev/null 2>&1 || return 1
 }
 
 write_conf() {
-  local port ip
-  port="$1"
+  local port="$1"
+  local ip
   ip="$(get_ip)"
 
   cat > "$CONF" <<EOF
@@ -101,7 +137,7 @@ FLAG="/tmp/s5_manual_stop"
 [ -f "$FLAG" ] && exit 0
 
 if ! ss -lnt | grep -q ":$PORT"; then
-  systemctl restart s5
+  systemctl restart s5 >/dev/null 2>&1
 fi
 EOF
   chmod +x "$CHECK_SCRIPT"
@@ -137,60 +173,132 @@ print_info() {
   echo
 }
 
+self_check() {
+  local port="$1"
+
+  [[ -x "$SOCKD_BIN" ]] || { echo "sockd 不存在: $SOCKD_BIN"; return 1; }
+  systemctl is-active "$SERVICE" >/dev/null 2>&1 || { echo "s5.service 未运行"; return 1; }
+  ss -lnt | grep -q ":$port" || { echo "端口未监听: $port"; return 1; }
+
+  return 0
+}
+
+show_error_hint() {
+  echo
+  echo "[提示] 可执行以下命令排查："
+  echo "systemctl status s5 --no-pager -l"
+  echo "journalctl -u s5 -n 50 --no-pager"
+  echo "ls -l ${SOCKD_BIN}"
+  echo
+}
+
 generate_s5() {
   local port
-  ensure_sockd
-  ensure_user
   port="$(get_port)"
   [[ "$port" =~ ^[0-9]+$ ]] || port="1080"
   echo "$port" > "$PORT_FILE"
-  write_conf "$port"
-  write_service
+
+  log "检查/安装 sockd..."
+  ensure_sockd || { fail "sockd 安装失败"; show_error_hint; return 1; }
+
+  log "写入账号..."
+  ensure_user || { fail "账号写入失败"; show_error_hint; return 1; }
+
+  log "写入配置..."
+  write_conf "$port" || { fail "配置写入失败"; show_error_hint; return 1; }
+
+  log "写入服务..."
+  write_service || { fail "服务文件写入失败"; show_error_hint; return 1; }
+
+  log "安装巡检..."
   write_check_script
   install_cron_check
+
   open_port "$port"
   rm -f "$MANUAL_STOP_FLAG"
+
+  log "启动服务..."
   systemctl enable "$SERVICE" >/dev/null 2>&1 || true
-  systemctl restart "$SERVICE"
+  systemctl restart "$SERVICE" >/dev/null 2>&1 || {
+    fail "s5 启动失败"
+    show_error_hint
+    return 1
+  }
+
+  self_check "$port" || {
+    fail "生成后自检失败"
+    show_error_hint
+    return 1
+  }
+
   echo "S5 已生成完成"
   print_info
+  return 0
 }
 
 show_info() {
   [[ -f "$PORT_FILE" ]] || { echo "S5 未生成"; return 1; }
   print_info
+  return 0
 }
 
 change_port() {
   local old_port new_port
-  [[ -f "$PORT_FILE" ]] || { generate_s5; return; }
+
+  [[ -f "$PORT_FILE" ]] || { generate_s5; return $?; }
 
   old_port="$(get_port)"
   new_port="$(rand_port)"
   echo "$new_port" > "$PORT_FILE"
 
-  write_conf "$new_port"
+  write_conf "$new_port" || { fail "配置写入失败"; return 1; }
   close_port "$old_port"
   open_port "$new_port"
   rm -f "$MANUAL_STOP_FLAG"
-  systemctl restart "$SERVICE"
+
+  systemctl restart "$SERVICE" >/dev/null 2>&1 || {
+    fail "端口修改后服务重启失败"
+    show_error_hint
+    return 1
+  }
+
+  self_check "$new_port" || {
+    fail "修改端口后自检失败"
+    show_error_hint
+    return 1
+  }
 
   echo "端口已修改，原端口已失效"
   print_info
+  return 0
 }
 
 start_s5() {
-  [[ -f "/etc/systemd/system/${SERVICE}.service" ]] || { generate_s5; return; }
+  [[ -f "/etc/systemd/system/${SERVICE}.service" ]] || { generate_s5; return $?; }
+
   rm -f "$MANUAL_STOP_FLAG"
-  systemctl start "$SERVICE"
+  systemctl start "$SERVICE" >/dev/null 2>&1 || {
+    fail "S5 启动失败"
+    show_error_hint
+    return 1
+  }
+
+  self_check "$(get_port)" || {
+    fail "启动后自检失败"
+    show_error_hint
+    return 1
+  }
+
   echo "S5 已启动"
   print_info
+  return 0
 }
 
 stop_s5() {
   touch "$MANUAL_STOP_FLAG"
   systemctl stop "$SERVICE" >/dev/null 2>&1 || true
   echo "S5 已停止"
+  return 0
 }
 
 menu_ui() {
@@ -210,14 +318,15 @@ EOF
 
   read -rp "请选择: " choice
   case "$choice" in
-    1) generate_s5 ;;
-    2) show_info ;;
-    3) change_port ;;
-    4) start_s5 ;;
-    5) stop_s5 ;;
+    1) if ! generate_s5; then echo "[S5] 生成失败"; fi ;;
+    2) if ! show_info; then echo "[S5] 查看失败"; fi ;;
+    3) if ! change_port; then echo "[S5] 修改端口失败"; fi ;;
+    4) if ! start_s5; then echo "[S5] 启动失败"; fi ;;
+    5) if ! stop_s5; then echo "[S5] 停止失败"; fi ;;
     0) exit 88 ;;
     *) echo "无效选项" ;;
   esac
+  return 0
 }
 
 while true; do
