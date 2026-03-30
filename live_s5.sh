@@ -1,24 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONF="/etc/3proxy/3proxy.cfg"
-PORT_FILE="/etc/3proxy_port"
-SERVICE_NAME="s5"
-PROXY_BIN="/usr/local/bin/3proxy"
+CONF="/etc/danted.conf"
+PORT_FILE="/etc/danted_port"
+SERVICE="s5"
+SOCKD_BIN="/usr/local/sbin/sockd"
 DEFAULT_USER="zxwl123"
 DEFAULT_PASS="zxwl123"
 
 [[ "$(id -u)" -ne 0 ]] && echo "请用 root 运行" && exit 1
-
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || {
-    apt-get update -yq
-    apt-get install -yq \
-      -o Dpkg::Options::="--force-confdef" \
-      -o Dpkg::Options::="--force-confold" \
-      "$2"
-  }
-}
 
 get_iface() {
   ip route | awk '/default/ {print $5; exit}'
@@ -33,70 +23,67 @@ port_in_use() {
   ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$p$"
 }
 
-get_port() {
-  [[ -f "$PORT_FILE" ]] && { cat "$PORT_FILE"; return; }
+rand_port() {
   local port
   while true; do
     port=$((RANDOM % 50000 + 10000))
     port_in_use "$port" || break
   done
-  echo "$port" > "$PORT_FILE"
   echo "$port"
 }
 
-ensure_3proxy() {
-  if [[ -x "$PROXY_BIN" ]]; then
-    return 0
-  fi
+get_port() {
+  [[ -f "$PORT_FILE" ]] && cat "$PORT_FILE" || echo "1080"
+}
 
-  need_cmd wget wget
-  need_cmd gcc gcc
-  need_cmd make make
-  need_cmd tar tar
+ensure_sockd() {
+  [[ -x "$SOCKD_BIN" ]] || { echo "sockd 不存在: $SOCKD_BIN"; exit 1; }
+}
 
-  cd /root
-  rm -rf 3proxy-0.9.4 3proxy-0.9.4.tar.gz
-  wget -q https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz -O 3proxy-0.9.4.tar.gz
-  tar -xzf 3proxy-0.9.4.tar.gz
-  cd 3proxy-0.9.4
-  make -f Makefile.Linux >/dev/null
-  install -m 755 bin/3proxy /usr/local/bin/3proxy
-
-  [[ -x "$PROXY_BIN" ]] || { echo "3proxy 安装失败"; exit 1; }
+ensure_user() {
+  useradd -M -s /usr/sbin/nologin "$DEFAULT_USER" 2>/dev/null || true
+  echo "${DEFAULT_USER}:${DEFAULT_PASS}" | chpasswd
 }
 
 write_conf() {
-  local port iface
-  port="$(get_port)"
+  local port iface ip
+  port="$1"
   iface="$(get_iface)"
-
-  mkdir -p /etc/3proxy
+  ip="$(get_ip)"
 
   cat > "$CONF" <<EOF
-daemon
-nserver 8.8.8.8
-nserver 1.1.1.1
-nscache 65536
-timeouts 1 5 30 60 180 1800 15 60
-users ${DEFAULT_USER}:CL:${DEFAULT_PASS}
-auth strong
-allow ${DEFAULT_USER}
-socks -p${port} -i0.0.0.0 -e$(get_ip)
-flush
+logoutput: stderr
+
+internal: 0.0.0.0 port = ${port}
+external: ${ip}
+
+socksmethod: username
+clientmethod: none
+
+user.privileged: root
+user.unprivileged: nobody
+
+client pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+}
+
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    socksmethod: username
+}
 EOF
 }
 
 write_service() {
-  cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+  cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
 [Unit]
-Description=S5 Proxy (3proxy)
+Description=S5 Proxy
 After=network.target
 
 [Service]
-Type=simple
-ExecStart=${PROXY_BIN} ${CONF}
+ExecStart=${SOCKD_BIN} -f ${CONF}
 Restart=always
-RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
@@ -105,8 +92,7 @@ EOF
 }
 
 open_port() {
-  local port
-  port="$(get_port)"
+  local port="$1"
   if command -v ufw >/dev/null 2>&1; then
     ufw allow "${port}/tcp" >/dev/null 2>&1 || true
     ufw allow "${port}/udp" >/dev/null 2>&1 || true
@@ -125,59 +111,53 @@ print_info() {
   echo
   echo "$(get_ip)"
   echo "$(get_port)"
-  echo "${DEFAULT_USER}"
-  echo "${DEFAULT_PASS}"
+  echo "$DEFAULT_USER"
+  echo "$DEFAULT_PASS"
   echo
 }
 
 generate_s5() {
-  ensure_3proxy
-  write_conf
+  local port
+  ensure_sockd
+  ensure_user
+  port="$(get_port)"
+  [[ "$port" =~ ^[0-9]+$ ]] || port="1080"
+  echo "$port" > "$PORT_FILE"
+  write_conf "$port"
   write_service
-  open_port
-  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
-  systemctl restart "$SERVICE_NAME"
+  open_port "$port"
+  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+  systemctl restart "$SERVICE"
   echo "S5 已生成完成"
   print_info
 }
 
 show_info() {
-  [[ -x "$PROXY_BIN" ]] || { echo "S5 未生成"; return 1; }
-  [[ -f "$CONF" ]] || { echo "S5 未生成"; return 1; }
+  [[ -f "$PORT_FILE" ]] || { echo "S5 未生成"; return 1; }
   print_info
 }
 
 change_port() {
-  [[ -f "$PORT_FILE" ]] || { generate_s5; return; }
-
   local old_port new_port
-  old_port="$(cat "$PORT_FILE")"
-  rm -f "$PORT_FILE"
-
-  while true; do
-    new_port=$((RANDOM % 50000 + 10000))
-    port_in_use "$new_port" || break
-  done
-
+  old_port="$(get_port)"
+  new_port="$(rand_port)"
   echo "$new_port" > "$PORT_FILE"
-  write_conf
+  write_conf "$new_port"
   close_port "$old_port"
-  open_port
-  systemctl restart "$SERVICE_NAME"
-
+  open_port "$new_port"
+  systemctl restart "$SERVICE"
   echo "端口已修改，原端口已失效"
   print_info
 }
 
 start_s5() {
-  [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]] || { generate_s5; return; }
-  systemctl start "$SERVICE_NAME"
+  systemctl start "$SERVICE"
   echo "S5 已启动"
   print_info
 }
 
 stop_s5() {
-  systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl stop "$SERVICE" >/dev/null 2>&1 || true
   echo "S5 已停止"
 }
 
