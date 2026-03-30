@@ -8,9 +8,9 @@ DEFAULT_USER="zxwl123"
 DEFAULT_PASS="zxwl123"
 MANUAL_STOP_FLAG="/tmp/s5_manual_stop"
 CHECK_SCRIPT="/usr/local/bin/s5-check.sh"
+
 SRC_DIR="/root/dante-1.4.2"
 SRC_TAR="/root/dante-1.4.2.tar.gz"
-SRC_URL="https://www.inet.no/dante/files/dante-1.4.2.tar.gz"
 
 [[ "$(id -u)" -ne 0 ]] && echo "请用 root 运行" && exit 1
 
@@ -30,11 +30,9 @@ detect_sockd_bin() {
     echo "$p"
     return 0
   fi
-
   for p in /usr/sbin/sockd /usr/local/sbin/sockd; do
     [[ -x "$p" ]] && { echo "$p"; return 0; }
   done
-
   return 1
 }
 
@@ -57,20 +55,50 @@ rand_port() {
 }
 
 get_port() {
-  [[ -f "$PORT_FILE" ]] && cat "$PORT_FILE" || echo "1080"
+  [[ -f "$PORT_FILE" ]] && cat "$PORT_FILE" || rand_port
 }
 
 ensure_deps() {
-  need_cmd apt-get apt || return 1
   need_cmd wget wget || return 1
+  need_cmd curl curl || return 1
   need_cmd tar tar || return 1
-  need_cmd make make || need_cmd make build-essential || return 1
-  need_cmd gcc gcc || need_cmd gcc build-essential || return 1
+  need_cmd make build-essential || return 1
+  need_cmd gcc build-essential || return 1
   need_cmd ss iproute2 || return 1
   need_cmd useradd passwd || return 1
   need_cmd chpasswd passwd || return 1
   need_cmd crontab cron || true
   return 0
+}
+
+download_with_retry() {
+  local out="$1"
+  shift
+  local urls=("$@")
+  local url
+  local tries
+
+  rm -f "$out"
+
+  for url in "${urls[@]}"; do
+    for tries in 1 2 3; do
+      log "下载: $url (第 ${tries} 次)"
+      if command -v curl >/dev/null 2>&1; then
+        curl -L --connect-timeout 15 --max-time 120 -o "$out" "$url" >/dev/null 2>&1 || true
+      else
+        wget -O "$out" "$url" >/dev/null 2>&1 || true
+      fi
+
+      if [[ -s "$out" ]] && tar -tzf "$out" >/dev/null 2>&1; then
+        return 0
+      fi
+
+      rm -f "$out"
+      sleep 2
+    done
+  done
+
+  return 1
 }
 
 install_sockd_by_apt() {
@@ -85,11 +113,15 @@ install_sockd_by_source() {
   cd /root || return 1
   rm -rf "$SRC_DIR" "$SRC_TAR"
 
-  wget -q "$SRC_URL" -O "$SRC_TAR" || return 1
-  tar -tzf "$SRC_TAR" >/dev/null 2>&1 || return 1
-  tar -xzf "$SRC_TAR" || return 1
+  download_with_retry "$SRC_TAR" \
+    "https://www.inet.no/dante/files/dante-1.4.2.tar.gz" \
+    "https://ghproxy.com/https://www.inet.no/dante/files/dante-1.4.2.tar.gz" \
+    "https://mirror.ghproxy.com/https://www.inet.no/dante/files/dante-1.4.2.tar.gz" \
+    || return 1
 
+  tar -xzf "$SRC_TAR" || return 1
   cd "$SRC_DIR" || return 1
+
   ./configure CFLAGS="-Wno-error" >/tmp/dante-configure.log 2>&1 || return 1
   make -j"$(nproc)" >/tmp/dante-make.log 2>&1 || return 1
   make install >/tmp/dante-install.log 2>&1 || return 1
@@ -98,9 +130,7 @@ install_sockd_by_source() {
 }
 
 ensure_sockd() {
-  local bin
-  bin="$(detect_sockd_bin || true)"
-  [[ -n "${bin:-}" ]] && return 0
+  detect_sockd_bin >/dev/null 2>&1 && return 0
 
   log "尝试通过 apt 安装 dante-server..."
   if install_sockd_by_apt; then
@@ -167,7 +197,6 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  return 0
 }
 
 write_check_script() {
@@ -222,18 +251,16 @@ self_check() {
 
   sockd_bin="$(detect_sockd_bin || true)"
   [[ -n "${sockd_bin:-}" ]] || { echo "sockd 不存在"; return 1; }
+  [[ -f "/etc/systemd/system/${SERVICE}.service" ]] || { echo "s5.service 不存在"; return 1; }
   systemctl is-active "$SERVICE" >/dev/null 2>&1 || { echo "s5.service 未运行"; return 1; }
   ss -lnt | grep -q ":$port" || { echo "端口未监听: $port"; return 1; }
   return 0
 }
 
 show_error_hint() {
-  local sockd_bin
-  sockd_bin="$(detect_sockd_bin || true)"
   echo
   echo "[提示] 可执行以下命令排查："
   echo "which sockd"
-  [[ -n "${sockd_bin:-}" ]] && echo "ls -l ${sockd_bin}" || echo "ls -l /usr/sbin/sockd /usr/local/sbin/sockd"
   echo "systemctl status s5 --no-pager -l"
   echo "journalctl -u s5 -n 50 --no-pager"
   echo
@@ -242,7 +269,7 @@ show_error_hint() {
 generate_s5() {
   local port
   port="$(get_port)"
-  [[ "$port" =~ ^[0-9]+$ ]] || port="1080"
+  [[ "$port" =~ ^[0-9]+$ ]] || port="$(rand_port)"
   echo "$port" > "$PORT_FILE"
 
   log "检查/安装 sockd..."
@@ -281,13 +308,11 @@ generate_s5() {
 
   echo "S5 已生成完成"
   print_info
-  return 0
 }
 
 show_info() {
   [[ -f "$PORT_FILE" ]] || { echo "S5 未生成"; return 1; }
   print_info
-  return 0
 }
 
 change_port() {
@@ -318,7 +343,6 @@ change_port() {
 
   echo "端口已修改，原端口已失效"
   print_info
-  return 0
 }
 
 start_s5() {
@@ -339,14 +363,12 @@ start_s5() {
 
   echo "S5 已启动"
   print_info
-  return 0
 }
 
 stop_s5() {
   touch "$MANUAL_STOP_FLAG"
   systemctl stop "$SERVICE" >/dev/null 2>&1 || true
   echo "S5 已停止"
-  return 0
 }
 
 menu_ui() {
