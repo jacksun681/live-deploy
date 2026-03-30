@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONF="/etc/danted.conf"
-PORT_FILE="/etc/danted_port"
+CONF="/etc/3proxy/3proxy.cfg"
+PORT_FILE="/etc/3proxy_port"
 SERVICE_NAME="s5"
-SOCKD_BIN="/usr/local/sbin/sockd"
+PROXY_BIN="/usr/local/bin/3proxy"
+DEFAULT_USER="zxwl123"
+DEFAULT_PASS="zxwl123"
 
 [[ "$(id -u)" -ne 0 ]] && echo "请用 root 运行" && exit 1
 
@@ -33,7 +35,6 @@ port_in_use() {
 
 get_port() {
   [[ -f "$PORT_FILE" ]] && { cat "$PORT_FILE"; return; }
-
   local port
   while true; do
     port=$((RANDOM % 50000 + 10000))
@@ -43,42 +44,57 @@ get_port() {
   echo "$port"
 }
 
+ensure_3proxy() {
+  if [[ -x "$PROXY_BIN" ]]; then
+    return 0
+  fi
+
+  need_cmd wget wget
+  need_cmd gcc gcc
+  need_cmd make make
+  need_cmd tar tar
+
+  cd /root
+  rm -rf 3proxy-0.9.4 3proxy-0.9.4.tar.gz
+  wget -q https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz -O 3proxy-0.9.4.tar.gz
+  tar -xzf 3proxy-0.9.4.tar.gz
+  cd 3proxy-0.9.4
+  make -f Makefile.Linux >/dev/null
+  install -m 755 bin/3proxy /usr/local/bin/3proxy
+
+  [[ -x "$PROXY_BIN" ]] || { echo "3proxy 安装失败"; exit 1; }
+}
+
 write_conf() {
-  local iface port
-  iface="$(get_iface)"
+  local port iface
   port="$(get_port)"
+  iface="$(get_iface)"
+
+  mkdir -p /etc/3proxy
 
   cat > "$CONF" <<EOF
-logoutput: stderr
-
-internal: ${iface} port = ${port}
-external: ${iface}
-
-user.privileged: root
-user.unprivileged: nobody
-
-socksmethod: none
-clientmethod: none
-
-client pass {
-  from: 0.0.0.0/0 to: 0.0.0.0/0
-}
-
-pass {
-  from: 0.0.0.0/0 to: 0.0.0.0/0
-  protocol: tcp udp
-}
+daemon
+nserver 8.8.8.8
+nserver 1.1.1.1
+nscache 65536
+timeouts 1 5 30 60 180 1800 15 60
+users ${DEFAULT_USER}:CL:${DEFAULT_PASS}
+auth strong
+allow ${DEFAULT_USER}
+socks -p${port} -i0.0.0.0 -e$(get_ip)
+flush
 EOF
 }
 
 write_service() {
   cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=Socks5 Proxy (Dante)
+Description=S5 Proxy (3proxy)
 After=network.target
 
 [Service]
-ExecStart=${SOCKD_BIN} -f ${CONF}
+Type=simple
+ExecStart=${PROXY_BIN} ${CONF}
 Restart=always
 RestartSec=3
 
@@ -86,28 +102,6 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-}
-
-ensure_sockd() {
-  if [[ -x "$SOCKD_BIN" ]]; then
-    return 0
-  fi
-
-  need_cmd wget wget
-  need_cmd gcc gcc
-  need_cmd g++ g++
-  need_cmd make make
-
-  cd /root
-  rm -rf dante-1.4.2 dante-1.4.2.tar.gz
-  wget -q https://www.inet.no/dante/files/dante-1.4.2.tar.gz
-  tar -xzf dante-1.4.2.tar.gz
-  cd dante-1.4.2
-  ./configure >/dev/null
-  make -j"$(nproc)" >/dev/null
-  make install >/dev/null
-
-  [[ -x "$SOCKD_BIN" ]] || { echo "sockd 安装失败"; exit 1; }
 }
 
 open_port() {
@@ -131,11 +125,13 @@ print_info() {
   echo
   echo "$(get_ip)"
   echo "$(get_port)"
+  echo "${DEFAULT_USER}"
+  echo "${DEFAULT_PASS}"
   echo
 }
 
 generate_s5() {
-  ensure_sockd
+  ensure_3proxy
   write_conf
   write_service
   open_port
@@ -146,7 +142,7 @@ generate_s5() {
 }
 
 show_info() {
-  [[ -x "$SOCKD_BIN" ]] || { echo "S5 未生成"; return 1; }
+  [[ -x "$PROXY_BIN" ]] || { echo "S5 未生成"; return 1; }
   [[ -f "$CONF" ]] || { echo "S5 未生成"; return 1; }
   print_info
 }
