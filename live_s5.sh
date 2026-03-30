@@ -7,12 +7,10 @@ SERVICE="s5"
 SOCKD_BIN="/usr/local/sbin/sockd"
 DEFAULT_USER="zxwl123"
 DEFAULT_PASS="zxwl123"
+MANUAL_STOP_FLAG="/tmp/s5_manual_stop"
+CHECK_SCRIPT="/usr/local/bin/s5-check.sh"
 
 [[ "$(id -u)" -ne 0 ]] && echo "请用 root 运行" && exit 1
-
-get_iface() {
-  ip route | awk '/default/ {print $5; exit}'
-}
 
 get_ip() {
   hostname -I | awk '{print $1}'
@@ -37,7 +35,11 @@ get_port() {
 }
 
 ensure_sockd() {
-  [[ -x "$SOCKD_BIN" ]] || { echo "sockd 不存在: $SOCKD_BIN"; exit 1; }
+  [[ -x "$SOCKD_BIN" ]] || {
+    echo "sockd 不存在: $SOCKD_BIN"
+    echo "请先确认 /usr/local/sbin/sockd 已安装可用"
+    exit 1
+  }
 }
 
 ensure_user() {
@@ -46,9 +48,8 @@ ensure_user() {
 }
 
 write_conf() {
-  local port iface ip
+  local port ip
   port="$1"
-  iface="$(get_iface)"
   ip="$(get_ip)"
 
   cat > "$CONF" <<EOF
@@ -57,8 +58,7 @@ logoutput: stderr
 internal: 0.0.0.0 port = ${port}
 external: ${ip}
 
-socksmethod: username
-clientmethod: none
+method: username
 
 user.privileged: root
 user.unprivileged: nobody
@@ -67,10 +67,9 @@ client pass {
     from: 0.0.0.0/0 to: 0.0.0.0/0
 }
 
-socks pass {
+pass {
     from: 0.0.0.0/0 to: 0.0.0.0/0
     protocol: tcp udp
-    socksmethod: username
 }
 EOF
 }
@@ -84,11 +83,33 @@ After=network.target
 [Service]
 ExecStart=${SOCKD_BIN} -f ${CONF}
 Restart=always
+RestartSec=2
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
+}
+
+write_check_script() {
+  cat > "$CHECK_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+PORT=$(cat /etc/danted_port 2>/dev/null || echo 1080)
+FLAG="/tmp/s5_manual_stop"
+
+[ -f "$FLAG" ] && exit 0
+
+if ! ss -lnt | grep -q ":$PORT"; then
+  systemctl restart s5
+fi
+EOF
+  chmod +x "$CHECK_SCRIPT"
+}
+
+install_cron_check() {
+  local line="*/2 * * * * /usr/local/bin/s5-check.sh"
+  (crontab -l 2>/dev/null | grep -v '/usr/local/bin/s5-check.sh' ; echo "$line") | crontab -
 }
 
 open_port() {
@@ -125,7 +146,10 @@ generate_s5() {
   echo "$port" > "$PORT_FILE"
   write_conf "$port"
   write_service
+  write_check_script
+  install_cron_check
   open_port "$port"
+  rm -f "$MANUAL_STOP_FLAG"
   systemctl enable "$SERVICE" >/dev/null 2>&1 || true
   systemctl restart "$SERVICE"
   echo "S5 已生成完成"
@@ -139,24 +163,32 @@ show_info() {
 
 change_port() {
   local old_port new_port
+  [[ -f "$PORT_FILE" ]] || { generate_s5; return; }
+
   old_port="$(get_port)"
   new_port="$(rand_port)"
   echo "$new_port" > "$PORT_FILE"
+
   write_conf "$new_port"
   close_port "$old_port"
   open_port "$new_port"
+  rm -f "$MANUAL_STOP_FLAG"
   systemctl restart "$SERVICE"
+
   echo "端口已修改，原端口已失效"
   print_info
 }
 
 start_s5() {
+  [[ -f "/etc/systemd/system/${SERVICE}.service" ]] || { generate_s5; return; }
+  rm -f "$MANUAL_STOP_FLAG"
   systemctl start "$SERVICE"
   echo "S5 已启动"
   print_info
 }
 
 stop_s5() {
+  touch "$MANUAL_STOP_FLAG"
   systemctl stop "$SERVICE" >/dev/null 2>&1 || true
   echo "S5 已停止"
 }
