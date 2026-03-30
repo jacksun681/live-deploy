@@ -4,7 +4,6 @@ set -u
 CONF="/etc/danted.conf"
 PORT_FILE="/etc/danted_port"
 SERVICE="s5"
-SOCKD_BIN="/usr/local/sbin/sockd"
 DEFAULT_USER="zxwl123"
 DEFAULT_PASS="zxwl123"
 MANUAL_STOP_FLAG="/tmp/s5_manual_stop"
@@ -22,6 +21,21 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 && return 0
   apt-get update -yq >/dev/null 2>&1 || true
   apt-get install -yq "$2" >/dev/null 2>&1 || return 1
+}
+
+detect_sockd_bin() {
+  local p
+  p="$(command -v sockd 2>/dev/null || true)"
+  if [[ -n "${p:-}" && -x "$p" ]]; then
+    echo "$p"
+    return 0
+  fi
+
+  for p in /usr/sbin/sockd /usr/local/sbin/sockd; do
+    [[ -x "$p" ]] && { echo "$p"; return 0; }
+  done
+
+  return 1
 }
 
 get_ip() {
@@ -47,35 +61,58 @@ get_port() {
 }
 
 ensure_deps() {
+  need_cmd apt-get apt || return 1
   need_cmd wget wget || return 1
-  need_cmd gcc gcc || return 1
-  need_cmd g++ g++ || true
-  need_cmd make make || return 1
   need_cmd tar tar || return 1
+  need_cmd make make || need_cmd make build-essential || return 1
+  need_cmd gcc gcc || need_cmd gcc build-essential || return 1
   need_cmd ss iproute2 || return 1
-  need_cmd useradd passwd || true
-  need_cmd chpasswd passwd || true
+  need_cmd useradd passwd || return 1
+  need_cmd chpasswd passwd || return 1
+  need_cmd crontab cron || true
   return 0
 }
 
-ensure_sockd() {
-  [[ -x "$SOCKD_BIN" ]] && return 0
+install_sockd_by_apt() {
+  apt-get update -yq >/dev/null 2>&1 || true
+  apt-get install -yq dante-server >/dev/null 2>&1 || return 1
+  detect_sockd_bin >/dev/null 2>&1
+}
 
+install_sockd_by_source() {
   ensure_deps || return 1
 
   cd /root || return 1
   rm -rf "$SRC_DIR" "$SRC_TAR"
 
   wget -q "$SRC_URL" -O "$SRC_TAR" || return 1
+  tar -tzf "$SRC_TAR" >/dev/null 2>&1 || return 1
   tar -xzf "$SRC_TAR" || return 1
-  cd "$SRC_DIR" || return 1
 
+  cd "$SRC_DIR" || return 1
   ./configure CFLAGS="-Wno-error" >/tmp/dante-configure.log 2>&1 || return 1
   make -j"$(nproc)" >/tmp/dante-make.log 2>&1 || return 1
   make install >/tmp/dante-install.log 2>&1 || return 1
 
-  [[ -x "$SOCKD_BIN" ]] || return 1
-  return 0
+  detect_sockd_bin >/dev/null 2>&1
+}
+
+ensure_sockd() {
+  local bin
+  bin="$(detect_sockd_bin || true)"
+  [[ -n "${bin:-}" ]] && return 0
+
+  log "尝试通过 apt 安装 dante-server..."
+  if install_sockd_by_apt; then
+    return 0
+  fi
+
+  log "apt 安装失败，尝试源码编译..."
+  if install_sockd_by_source; then
+    return 0
+  fi
+
+  return 1
 }
 
 ensure_user() {
@@ -111,13 +148,16 @@ EOF
 }
 
 write_service() {
+  local sockd_bin
+  sockd_bin="$(detect_sockd_bin)" || return 1
+
   cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
 [Unit]
 Description=S5 Proxy
 After=network.target
 
 [Service]
-ExecStart=${SOCKD_BIN} -f ${CONF}
+ExecStart=${sockd_bin} -f ${CONF}
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -125,7 +165,9 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+
   systemctl daemon-reload
+  return 0
 }
 
 write_check_script() {
@@ -144,6 +186,7 @@ EOF
 }
 
 install_cron_check() {
+  command -v crontab >/dev/null 2>&1 || return 0
   local line="*/2 * * * * /usr/local/bin/s5-check.sh"
   (crontab -l 2>/dev/null | grep -v '/usr/local/bin/s5-check.sh' ; echo "$line") | crontab -
 }
@@ -175,20 +218,24 @@ print_info() {
 
 self_check() {
   local port="$1"
+  local sockd_bin
 
-  [[ -x "$SOCKD_BIN" ]] || { echo "sockd 不存在: $SOCKD_BIN"; return 1; }
+  sockd_bin="$(detect_sockd_bin || true)"
+  [[ -n "${sockd_bin:-}" ]] || { echo "sockd 不存在"; return 1; }
   systemctl is-active "$SERVICE" >/dev/null 2>&1 || { echo "s5.service 未运行"; return 1; }
   ss -lnt | grep -q ":$port" || { echo "端口未监听: $port"; return 1; }
-
   return 0
 }
 
 show_error_hint() {
+  local sockd_bin
+  sockd_bin="$(detect_sockd_bin || true)"
   echo
   echo "[提示] 可执行以下命令排查："
+  echo "which sockd"
+  [[ -n "${sockd_bin:-}" ]] && echo "ls -l ${sockd_bin}" || echo "ls -l /usr/sbin/sockd /usr/local/sbin/sockd"
   echo "systemctl status s5 --no-pager -l"
   echo "journalctl -u s5 -n 50 --no-pager"
-  echo "ls -l ${SOCKD_BIN}"
   echo
 }
 
@@ -219,6 +266,7 @@ generate_s5() {
 
   log "启动服务..."
   systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+  systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
   systemctl restart "$SERVICE" >/dev/null 2>&1 || {
     fail "s5 启动失败"
     show_error_hint
