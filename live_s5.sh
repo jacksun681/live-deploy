@@ -2,10 +2,8 @@
 set -euo pipefail
 
 CONF="/etc/danted.conf"
-PASSFILE="/etc/danted_passwd"
 PORT_FILE="/etc/danted_port"
 SYSCTL_CONF="/etc/sysctl.d/99-live-s5.conf"
-SERVICE="danted"
 DEFAULT_USER="zxwl123"
 DEFAULT_PASS="zxwl123"
 
@@ -23,10 +21,31 @@ need_pkg() {
 
 install_deps() {
   need_pkg dante-server
-  need_pkg apache2-utils
   need_pkg iproute2
   need_pkg curl
+  need_pkg passwd
 }
+
+get_service_name() {
+  if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'sockd.service'; then
+    echo "sockd"
+    return
+  fi
+  if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'danted.service'; then
+    echo "danted"
+    return
+  fi
+  if [[ -f /lib/systemd/system/sockd.service || -f /etc/systemd/system/sockd.service ]]; then
+    echo "sockd"
+    return
+  fi
+  echo "danted"
+}
+
+svc_enable()  { systemctl enable "$(get_service_name)" >/dev/null 2>&1 || true; }
+svc_start()   { systemctl start  "$(get_service_name)"; }
+svc_stop()    { systemctl stop   "$(get_service_name)"; }
+svc_restart() { systemctl restart "$(get_service_name)"; }
 
 get_iface() {
   ip route | awk '/default/ {print $5; exit}'
@@ -36,13 +55,18 @@ get_ip() {
   curl -4 -s https://api.ipify.org || hostname -I | awk '{print $1}'
 }
 
+port_in_use() {
+  local p="$1"
+  ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$p$"
+}
+
 get_port() {
   [[ -f "$PORT_FILE" ]] && { cat "$PORT_FILE"; return; }
 
   local port
   while true; do
     port=$((RANDOM % 50000 + 10000))
-    ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$port$" || break
+    port_in_use "$port" || break
   done
 
   echo "$port" > "$PORT_FILE"
@@ -106,19 +130,11 @@ pass {
 EOF
 }
 
-ensure_passfile() {
-  touch "$PASSFILE"
-  chmod 600 "$PASSFILE"
-
-  if ! grep -q "^${DEFAULT_USER}:" "$PASSFILE" 2>/dev/null; then
-    htpasswd -bB "$PASSFILE" "$DEFAULT_USER" "$DEFAULT_PASS" >/dev/null 2>&1
-    echo "已创建默认账号: ${DEFAULT_USER} / ${DEFAULT_PASS}"
-  fi
-}
-
 write_service_override() {
-  mkdir -p /etc/systemd/system/${SERVICE}.service.d
-  cat >/etc/systemd/system/${SERVICE}.service.d/override.conf <<'EOF'
+  local svc
+  svc="$(get_service_name)"
+  mkdir -p "/etc/systemd/system/${svc}.service.d"
+  cat >"/etc/systemd/system/${svc}.service.d/override.conf" <<'EOF'
 [Service]
 Restart=always
 RestartSec=3
@@ -129,65 +145,80 @@ EOF
   systemctl daemon-reload
 }
 
-ensure_s5() {
-  install_deps
-  write_sysctl
-  write_conf
-  ensure_passfile
-  write_service_override
-  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
-  systemctl restart "$SERVICE"
-  echo "S5 已完成初始化/修复"
+user_exists() {
+  id "$1" >/dev/null 2>&1
+}
+
+ensure_user() {
+  local user="$1" pass="$2"
+
+  if ! user_exists "$user"; then
+    useradd -M -s /usr/sbin/nologin "$user"
+  fi
+
+  echo "${user}:${pass}" | chpasswd
+}
+
+list_s5_users() {
+  awk -F: '
+    ($7=="/usr/sbin/nologin" || $7=="/usr/bin/nologin") &&
+    ($1=="zxwl123" || $1 ~ /^s5user[0-9]+$/) {print $1}
+  ' /etc/passwd
 }
 
 list_users() {
-  [[ -s "$PASSFILE" ]] || { echo "暂无用户"; return; }
-  nl -w2 -s'. ' <(cut -d: -f1 "$PASSFILE")
+  local users
+  users="$(list_s5_users || true)"
+  [[ -n "${users:-}" ]] || { echo "暂无用户"; return; }
+  nl -w2 -s'. ' <(printf "%s\n" "$users")
 }
 
 user_by_index() {
-  cut -d: -f1 "$PASSFILE" | sed -n "${1}p"
+  list_s5_users | sed -n "${1}p"
 }
 
 next_user_name() {
   local n
-  n="$(cut -d: -f1 "$PASSFILE" 2>/dev/null | grep -E '^s5user[0-9]+$' | sed 's/s5user//' | sort -n | tail -n1)"
+  n="$(list_s5_users | grep -E '^s5user[0-9]+$' | sed 's/s5user//' | sort -n | tail -n1)"
   [[ -z "${n:-}" ]] && n=0
   echo "s5user$((n+1))"
 }
 
-rand_pass() {
-  tr -dc A-Za-z0-9 </dev/urandom | head -c 10
+ensure_s5() {
+  install_deps
+  write_sysctl
+  write_conf
+  ensure_user "$DEFAULT_USER" "$DEFAULT_PASS"
+  write_service_override
+  svc_enable
+  svc_restart
+  echo "S5 已完成初始化/修复"
 }
 
 show_info() {
   ensure_s5 >/dev/null 2>&1 || true
   echo
-  echo "地址: $(get_ip)"
-  echo "端口: $(get_port)"
-  echo "账号: ${DEFAULT_USER}"
-  echo "密码: ${DEFAULT_PASS}"
+  echo "$(get_ip)"
+  echo "$(get_port)"
+  echo "${DEFAULT_USER}"
+  echo "${DEFAULT_PASS}"
   echo
-  echo "当前用户:"
   list_users
   echo
 }
 
 add_user() {
   ensure_s5 >/dev/null 2>&1 || true
-  local user pass
+  local user
   user="$(next_user_name)"
-  pass="$(rand_pass)"
-
-  htpasswd -bB "$PASSFILE" "$user" "$pass" >/dev/null 2>&1
-  systemctl restart "$SERVICE"
+  ensure_user "$user" "$DEFAULT_PASS"
+  svc_restart
 
   echo
-  echo "已新增用户"
-  echo "地址: $(get_ip)"
-  echo "端口: $(get_port)"
-  echo "账号: $user"
-  echo "密码: $pass"
+  echo "$(get_ip)"
+  echo "$(get_port)"
+  echo "$user"
+  echo "${DEFAULT_PASS}"
   echo
 }
 
@@ -205,8 +236,8 @@ delete_user() {
   [[ -n "${user:-}" ]] || { echo "序号无效"; return 1; }
   [[ "$user" == "$DEFAULT_USER" ]] && { echo "默认账号不建议删除"; return 1; }
 
-  htpasswd -D "$PASSFILE" "$user" >/dev/null 2>&1 || true
-  systemctl restart "$SERVICE"
+  userdel "$user" >/dev/null 2>&1 || true
+  svc_restart
   echo "已删除用户: $user"
 }
 
@@ -216,45 +247,49 @@ reset_user_pass() {
   list_users
   echo
 
-  local idx user pass
+  local idx user
   read -rp "请输入要重置密码的序号: " idx
   [[ "$idx" =~ ^[0-9]+$ ]] || { echo "请输入数字序号"; return 1; }
 
   user="$(user_by_index "$idx")"
   [[ -n "${user:-}" ]] || { echo "序号无效"; return 1; }
 
-  if [[ "$user" == "$DEFAULT_USER" ]]; then
-    pass="$DEFAULT_PASS"
-  else
-    pass="$(rand_pass)"
-  fi
-
-  htpasswd -bB "$PASSFILE" "$user" "$pass" >/dev/null 2>&1
-  systemctl restart "$SERVICE"
+  ensure_user "$user" "$DEFAULT_PASS"
+  svc_restart
 
   echo
-  echo "已重置密码"
-  echo "地址: $(get_ip)"
-  echo "端口: $(get_port)"
-  echo "账号: $user"
-  echo "密码: $pass"
+  echo "$(get_ip)"
+  echo "$(get_port)"
+  echo "$user"
+  echo "${DEFAULT_PASS}"
   echo
 }
 
 regen_port() {
+  ensure_s5 >/dev/null 2>&1 || true
   rm -f "$PORT_FILE"
+
+  local port
+  while true; do
+    port=$((RANDOM % 50000 + 10000))
+    port_in_use "$port" || break
+  done
+
+  echo "$port" > "$PORT_FILE"
+  chmod 600 "$PORT_FILE"
   write_conf
-  systemctl restart "$SERVICE"
-  echo "已重新生成随机端口: $(get_port)"
+  svc_restart
+  echo "已重新生成随机端口: $port"
 }
 
 start_s5() {
-  systemctl start "$SERVICE"
+  ensure_s5 >/dev/null 2>&1 || true
+  svc_start
   echo "S5 已启动"
 }
 
 stop_s5() {
-  systemctl stop "$SERVICE"
+  svc_stop
   echo "S5 已停止"
 }
 
