@@ -615,6 +615,19 @@ restart_xray() {
   echo "Xray 已重启"
 }
 
+# ===== 新增：S5 管理入口 =====
+run_s5_menu() {
+  local s5_real="/usr/local/bin/live_s5.real"
+  [[ -x "$s5_real" ]] || { echo "S5 工具不存在"; return 1; }
+  bash "$s5_real"
+  local rc=$?
+  if [[ "$rc" -eq 88 ]]; then
+    return 10
+  fi
+  return 10
+}
+# ===== 新增结束 =====
+
 menu_ui() {
   clear
   cat <<EOF
@@ -628,6 +641,7 @@ menu_ui() {
 5. 重置用户
 6. 状态
 7. 重启
+8. S5 管理
 0. 退出
 ==============================
 EOF
@@ -641,6 +655,7 @@ EOF
     5) reset_user ;;
     6) show_status ;;
     7) restart_xray ;;
+    8) run_s5_menu; return $? ;;
     0) exit 0 ;;
     *) echo "无效选项" ;;
   esac
@@ -654,7 +669,11 @@ case "${1:-}" in
 esac
 
 while true; do
-  menu_ui
+  rc=0
+  menu_ui || rc=$?
+  if [[ "$rc" -eq 10 ]]; then
+    continue
+  fi
   echo
   read -rp "按回车返回菜单..." _
 done
