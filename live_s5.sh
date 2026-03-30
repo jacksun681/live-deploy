@@ -1,58 +1,29 @@
-垃圾桶#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 CONF="/etc/danted.conf"
 PORT_FILE="/etc/danted_port"
-SYSCTL_CONF="/etc/sysctl.d/99-live-s5.conf"
-DEFAULT_USER="zxwl123"
-DEFAULT_PASS="zxwl123"
+SERVICE_NAME="s5"
+SOCKD_BIN="/usr/local/sbin/sockd"
 
 [[ "$(id -u)" -ne 0 ]] && echo "请用 root 运行" && exit 1
 
-need_pkg() {
-  dpkg -s "$1" >/dev/null 2>&1 || {
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
     apt-get update -yq
     apt-get install -yq \
       -o Dpkg::Options::="--force-confdef" \
       -o Dpkg::Options::="--force-confold" \
-      "$1"
+      "$2"
   }
 }
-
-install_deps() {
-  need_pkg dante-server
-  need_pkg iproute2
-  need_pkg curl
-  need_pkg passwd
-}
-
-get_service_name() {
-  if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'sockd.service'; then
-    echo "sockd"
-    return
-  fi
-  if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'danted.service'; then
-    echo "danted"
-    return
-  fi
-  if [[ -f /lib/systemd/system/sockd.service || -f /etc/systemd/system/sockd.service ]]; then
-    echo "sockd"
-    return
-  fi
-  echo "danted"
-}
-
-svc_enable()  { systemctl enable  "$(get_service_name)" >/dev/null 2>&1 || true; }
-svc_start()   { systemctl start   "$(get_service_name)"; }
-svc_stop()    { systemctl stop    "$(get_service_name)"; }
-svc_restart() { systemctl restart "$(get_service_name)"; }
 
 get_iface() {
   ip route | awk '/default/ {print $5; exit}'
 }
 
 get_ip() {
-  curl -4 -s https://api.ipify.org || hostname -I | awk '{print $1}'
+  hostname -I | awk '{print $1}'
 }
 
 port_in_use() {
@@ -68,32 +39,8 @@ get_port() {
     port=$((RANDOM % 50000 + 10000))
     port_in_use "$port" || break
   done
-
   echo "$port" > "$PORT_FILE"
-  chmod 600 "$PORT_FILE"
   echo "$port"
-}
-
-write_sysctl() {
-  cat >"$SYSCTL_CONF" <<'EOF'
-net.core.default_qdisc=fq
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_mtu_probing=1
-net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_sack=1
-net.ipv4.tcp_window_scaling=1
-net.ipv4.tcp_no_metrics_save=1
-net.core.somaxconn=4096
-net.core.netdev_max_backlog=16384
-net.ipv4.tcp_max_syn_backlog=8192
-net.ipv4.tcp_fin_timeout=15
-net.ipv4.tcp_tw_reuse=1
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
-net.ipv4.tcp_rmem=4096 87380 16777216
-net.ipv4.tcp_wmem=4096 65536 16777216
-EOF
-  sysctl --system >/dev/null 2>&1 || true
 }
 
 write_conf() {
@@ -101,61 +48,71 @@ write_conf() {
   iface="$(get_iface)"
   port="$(get_port)"
 
-  cat >"$CONF" <<EOF
-logoutput: syslog
-internal: 0.0.0.0 port = ${port}
+  cat > "$CONF" <<EOF
+logoutput: stderr
+
+internal: ${iface} port = ${port}
 external: ${iface}
 
 user.privileged: root
 user.unprivileged: nobody
-user.libwrap: nobody
 
-socksmethod: username
+socksmethod: none
 clientmethod: none
-
-timeout.negotiate: 30
-timeout.io: 300
 
 client pass {
   from: 0.0.0.0/0 to: 0.0.0.0/0
-  log: error connect disconnect
 }
 
 pass {
   from: 0.0.0.0/0 to: 0.0.0.0/0
   protocol: tcp udp
-  socksmethod: username
-  log: error connect disconnect
 }
 EOF
 }
 
-write_service_override() {
-  local svc
-  svc="$(get_service_name)"
-  mkdir -p "/etc/systemd/system/${svc}.service.d"
-  cat >"/etc/systemd/system/${svc}.service.d/override.conf" <<'EOF'
+write_service() {
+  cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Socks5 Proxy (Dante)
+After=network.target
+
 [Service]
+ExecStart=${SOCKD_BIN} -f ${CONF}
 Restart=always
 RestartSec=3
 
-[Unit]
-StartLimitIntervalSec=0
+[Install]
+WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
 }
 
-ensure_user() {
-  if ! id "$DEFAULT_USER" >/dev/null 2>&1; then
-    useradd -M -s /usr/sbin/nologin "$DEFAULT_USER"
+ensure_sockd() {
+  if [[ -x "$SOCKD_BIN" ]]; then
+    return 0
   fi
-  echo "${DEFAULT_USER}:${DEFAULT_PASS}" | chpasswd
+
+  need_cmd wget wget
+  need_cmd gcc gcc
+  need_cmd g++ g++
+  need_cmd make make
+
+  cd /root
+  rm -rf dante-1.4.2 dante-1.4.2.tar.gz
+  wget -q https://www.inet.no/dante/files/dante-1.4.2.tar.gz
+  tar -xzf dante-1.4.2.tar.gz
+  cd dante-1.4.2
+  ./configure >/dev/null
+  make -j"$(nproc)" >/dev/null
+  make install >/dev/null
+
+  [[ -x "$SOCKD_BIN" ]] || { echo "sockd 安装失败"; exit 1; }
 }
 
 open_port() {
   local port
   port="$(get_port)"
-
   if command -v ufw >/dev/null 2>&1; then
     ufw allow "${port}/tcp" >/dev/null 2>&1 || true
     ufw allow "${port}/udp" >/dev/null 2>&1 || true
@@ -174,34 +131,31 @@ print_info() {
   echo
   echo "$(get_ip)"
   echo "$(get_port)"
-  echo "${DEFAULT_USER}"
-  echo "${DEFAULT_PASS}"
   echo
 }
 
 generate_s5() {
-  install_deps
-  write_sysctl
+  ensure_sockd
   write_conf
-  ensure_user
-  write_service_override
-  svc_enable
+  write_service
   open_port
-  svc_restart
+  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl restart "$SERVICE_NAME"
   echo "S5 已生成完成"
   print_info
 }
 
 show_info() {
-  generate_s5 >/dev/null 2>&1 || true
+  [[ -x "$SOCKD_BIN" ]] || { echo "S5 未生成"; return 1; }
+  [[ -f "$CONF" ]] || { echo "S5 未生成"; return 1; }
   print_info
 }
 
 change_port() {
-  generate_s5 >/dev/null 2>&1 || true
+  [[ -f "$PORT_FILE" ]] || { generate_s5; return; }
 
   local old_port new_port
-  old_port="$(get_port)"
+  old_port="$(cat "$PORT_FILE")"
   rm -f "$PORT_FILE"
 
   while true; do
@@ -210,26 +164,24 @@ change_port() {
   done
 
   echo "$new_port" > "$PORT_FILE"
-  chmod 600 "$PORT_FILE"
-
   write_conf
   close_port "$old_port"
   open_port
-  svc_restart
+  systemctl restart "$SERVICE_NAME"
 
   echo "端口已修改，原端口已失效"
   print_info
 }
 
 start_s5() {
-  generate_s5 >/dev/null 2>&1 || true
-  svc_start
+  [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]] || { generate_s5; return; }
+  systemctl start "$SERVICE_NAME"
   echo "S5 已启动"
   print_info
 }
 
 stop_s5() {
-  svc_stop
+  systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
   echo "S5 已停止"
 }
 
