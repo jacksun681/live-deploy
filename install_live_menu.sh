@@ -4,11 +4,13 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 REAL_PATH="/usr/local/bin/live_menu.real"
+S5_REAL="/usr/local/bin/live_s5.real"
 MENU_PATH="/usr/local/bin/menu"
 COMPAT_PATH="/usr/local/bin/live_menu"
 BACKUP_DIR="/usr/local/lib/live_menu"
 LOCAL_INSTALLER="/root/install_live_menu.sh"
 SCRIPT_NAME="live_menu.sh"
+SCRIPT_S5="live_s5.sh"
 
 URLS=(
   "https://raw.githubusercontent.com/jacksun681/live-deploy/main/${SCRIPT_NAME}"
@@ -93,6 +95,50 @@ download_main() {
   echo "所有下载源都失败了"
   return 1
 }
+
+# ===== 新增：下载 S5 模块 =====
+download_s5() {
+  local base_url s5_url tmp=""
+  tmp="$(mktemp)"
+  trap '[ -n "${tmp:-}" ] && rm -f "$tmp"' RETURN
+
+  for base_url in "${URLS[@]}"; do
+    s5_url="${base_url%/*}/${SCRIPT_S5}"
+    echo "[尝试下载] $s5_url"
+
+    if ! curl -fsSL --max-time 20 "$s5_url" -o "$tmp" 2>/dev/null; then
+      echo "[失败] 下载失败"
+      continue
+    fi
+
+    normalize_file "$tmp"
+
+    grep -q '^#!/usr/bin/env bash' "$tmp" || {
+      echo "[跳过] 不是 bash 脚本"
+      continue
+    }
+
+    if grep -qi '<!DOCTYPE html>\|<html' "$tmp"; then
+      echo "[跳过] 返回的是 HTML 页面"
+      continue
+    fi
+
+    if ! bash -n "$tmp" 2>/dev/null; then
+      echo "[跳过] 语法检查失败"
+      continue
+    fi
+
+    install -m 755 "$tmp" "$S5_REAL"
+    normalize_file "$S5_REAL"
+
+    echo "[成功] 已安装到 $S5_REAL"
+    return 0
+  done
+
+  echo "[提示] S5 模块下载失败，主菜单仍可正常使用"
+  return 0
+}
+# ===== 新增结束 =====
 
 create_wrapper() {
   cat > "$MENU_PATH" <<'EOF'
@@ -179,6 +225,7 @@ main() {
   case "${1:-help}" in
     install)
       download_main
+      download_s5
       create_wrapper
       echo "[完成] 已安装菜单命令: menu"
       first_bootstrap
