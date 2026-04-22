@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HISTORY_MAX=5
+HISTORY_MAX=20
 RATE_SAMPLE_SECONDS=2
 
 declare -a UP_HISTORY=()
 declare -a DOWN_HISTORY=()
+declare -a LAT_HISTORY=()
+declare -a JIT_HISTORY=()
 declare -a STATUS_HISTORY=()
 
 need_cmd() {
@@ -28,6 +30,7 @@ install_deps() {
   need_cmd top procps
   need_cmd free procps
   need_cmd dig dnsutils
+  need_cmd python3 python3
   return 0
 }
 
@@ -101,6 +104,38 @@ stddev_hist() {
     for(i=1;i<=n;i++) var+=(a[i]-mean)^2;
     printf "%.2f", sqrt(var/n);
   }'
+}
+
+sparkline() {
+  local arr_name="$1"
+  eval "local vals=(\"\${$arr_name[@]}\")"
+  python3 - "${vals[@]}" <<'PY'
+import sys
+chars = "⣀⣄⣆⣇⣧⣷⣿"
+vals = []
+for x in sys.argv[1:]:
+    try:
+        vals.append(float(x))
+    except Exception:
+        pass
+
+if not vals:
+    print("—")
+    raise SystemExit
+
+mn = min(vals)
+mx = max(vals)
+if abs(mx - mn) < 1e-12:
+    print(chars[0] * len(vals))
+    raise SystemExit
+
+out = []
+for v in vals:
+    idx = int((v - mn) / (mx - mn) * (len(chars) - 1))
+    idx = max(0, min(idx, len(chars) - 1))
+    out.append(chars[idx])
+print("".join(out))
+PY
 }
 
 ratio_safe() {
@@ -448,13 +483,17 @@ render() {
   echo
   echo "----------- 流量 -----------"
   printf "上行：%6s Mbps\n" "$TX_MBPS"
+  echo "趋势：$(sparkline UP_HISTORY)"
   printf "下行：%6s Mbps\n" "$RX_MBPS"
+  echo "趋势：$(sparkline DOWN_HISTORY)"
   printf "均上：%6s Mbps\n" "$AVG_TX"
   printf "均下：%6s Mbps\n" "$AVG_RX"
   echo "连接：$CONN"
   echo "重传：$RETRANS"
   echo
   echo "-------- 网络质量 --------"
+  echo "延迟趋势：$(sparkline LAT_HISTORY)"
+  echo "抖动趋势：$(sparkline JIT_HISTORY)"
   echo "TikTok：$TT_LAT ms / $TT_JIT ms / $TT_LOSS% / $TT_TIME s"
   echo "公共：  $PUB_LAT ms / $PUB_JIT ms / $PUB_LOSS% / $PUB_TIME s"
   echo
@@ -496,6 +535,9 @@ diagnose_loop() {
     TT_TIME="$(https_time https://www.tiktok.com)"
     TT_OK="fail"
     awk -v x="$TT_TIME" 'BEGIN{exit !(x<3.0)}' && TT_OK="ok"
+
+    push_hist LAT_HISTORY "$PUB_LAT"
+    push_hist JIT_HISTORY "$PUB_JIT"
 
     probe_tiktok_ips
 
