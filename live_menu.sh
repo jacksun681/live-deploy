@@ -6,7 +6,7 @@ export DEBIAN_FRONTEND=noninteractive
 CONF="/usr/local/etc/xray/config.json"
 ETC_CONF="/etc/xray/config.json"
 SYSCTL_CONF="/etc/sysctl.d/99-live.conf"
-DOMAIN="www.cloudflare.com"
+DOMAIN="www.microsoft.com"
 PORT="443"
 FLOW="xtls-rprx-vision"
 
@@ -77,6 +77,66 @@ get_public_ip() {
   [[ -z "$ip" ]] && ip="$(hostname -I | awk '{print $1}')"
   [[ -z "$ip" ]] && read -rp "请输入公网 IP: " ip
   echo "$ip"
+}
+
+write_print_commands() {
+  cat > /usr/local/bin/show_vless <<'EOF'
+#!/usr/bin/env bash
+python3 - <<'PY'
+import json, subprocess, urllib.parse, urllib.request, os
+
+CFG="/usr/local/etc/xray/config.json"
+data=json.load(open(CFG))
+
+inb=data["inbounds"][0]
+port=inb["port"]
+client=inb["settings"]["clients"][0]
+uuid=client["id"]
+flow=client.get("flow","xtls-rprx-vision")
+
+rs=inb["streamSettings"]["realitySettings"]
+sni=rs["serverNames"][0]
+sid=rs["shortIds"][0]
+pri=rs["privateKey"]
+
+raw=subprocess.check_output(["xray","x25519","-i",pri], text=True)
+
+pbk=""
+ for_line = raw.splitlines()
+for line in for_line:
+    if ":" in line:
+        k,v=line.split(":",1)
+        if "Public" in k or "Password" in k:
+            pbk=v.strip()
+            break
+
+try:
+    ip=urllib.request.urlopen("https://ifconfig.me", timeout=5).read().decode().strip()
+except:
+    ip=os.popen("hostname -I | awk '{print $1}'").read().strip()
+
+name=urllib.parse.quote("Reality")
+print(f"vless://{uuid}@{ip}:{port}?encryption=none&security=reality&sni={sni}&fp=chrome&pbk={pbk}&sid={sid}&type=tcp&headerType=none&flow={flow}#{name}")
+PY
+EOF
+
+  sed -i 's/^ pbk/pbk/' /usr/local/bin/show_vless 2>/dev/null || true
+  chmod +x /usr/local/bin/show_vless
+
+  cat > /usr/local/bin/show_s5 <<'EOF'
+#!/usr/bin/env bash
+IP="$(curl -4 -s https://api.ipify.org || curl -4 -s https://ifconfig.me || hostname -I | awk '{print $1}')"
+PORT="$(cat /etc/danted_port 2>/dev/null || cat /etc/3proxy_port 2>/dev/null || echo 1080)"
+USER="zxwl123"
+PASS="zxwl123"
+
+echo "$IP"
+echo "$PORT"
+echo "$USER"
+echo "$PASS"
+EOF
+
+  chmod +x /usr/local/bin/show_s5
 }
 
 test_tcp_jitter() {
@@ -186,6 +246,7 @@ write_new_config() {
 EOF
 
   ensure_conf_link
+  write_print_commands
   systemctl enable xray >/dev/null 2>&1 || true
   systemctl restart xray
 }
@@ -195,7 +256,7 @@ python3 - <<'PY'
 import json, os, sys, subprocess, secrets
 
 conf="/usr/local/etc/xray/config.json"
-domain="www.cloudflare.com"
+domain="www.microsoft.com"
 flow="xtls-rprx-vision"
 
 if not os.path.exists(conf):
@@ -327,6 +388,7 @@ ensure_base_config() {
     uuid="$(new_uuid)"
     shortids_json="$(new_short_ids_json)"
     write_new_config "$uuid" "$pri" "$shortids_json"
+    write_print_commands
     return
   fi
 
@@ -345,11 +407,13 @@ ensure_base_config() {
       uuid="$(new_uuid)"
       shortids_json="$(new_short_ids_json)"
       write_new_config "$uuid" "$pri" "$shortids_json"
+      write_print_commands
       return
     fi
   fi
 
   ensure_conf_link
+  write_print_commands
   systemctl restart xray
 }
 
@@ -448,6 +512,7 @@ with open(conf,"w",encoding="utf-8") as f:
     json.dump(data,f,ensure_ascii=False,indent=2)
 PY
     ensure_conf_link
+    write_print_commands
     systemctl restart xray
   fi
 }
@@ -471,6 +536,7 @@ print_first_link() {
 
 show_links() {
   ensure_base_config
+  write_print_commands
   local idx name uuid flow
   while IFS='|' read -r idx name uuid flow; do
     [[ -z "$uuid" ]] && continue
@@ -478,6 +544,7 @@ show_links() {
     build_link "$uuid" "$name" "$flow"
     echo
   done < <(list_users_raw)
+  echo "快捷命令: show_vless"
 }
 
 add_user() {
@@ -510,6 +577,7 @@ with open(conf,"w",encoding="utf-8") as f:
 PY
 
   ensure_conf_link
+  write_print_commands
   systemctl restart xray
   echo
   echo "已新增用户: $name"
@@ -554,6 +622,7 @@ with open(conf,"w",encoding="utf-8") as f:
 PY
 
   ensure_conf_link
+  write_print_commands
   systemctl restart xray
   echo "已删除用户: $name"
 }
@@ -599,6 +668,7 @@ with open(conf,"w",encoding="utf-8") as f:
 PY
 
   ensure_conf_link
+  write_print_commands
   systemctl restart xray
   echo
   echo "已重置用户: $name"
@@ -615,10 +685,10 @@ restart_xray() {
   echo "Xray 已重启"
 }
 
-# ===== 新增：S5 管理入口 =====
 run_s5_menu() {
   local s5_real="/usr/local/bin/live_s5.real"
   [[ -x "$s5_real" ]] || { echo "S5 工具不存在"; return 1; }
+  write_print_commands
   bash "$s5_real"
   local rc=$?
   if [[ "$rc" -eq 88 ]]; then
@@ -626,7 +696,6 @@ run_s5_menu() {
   fi
   return 10
 }
-# ===== 新增结束 =====
 
 menu_ui() {
   clear
@@ -664,9 +733,12 @@ EOF
 case "${1:-}" in
   --bootstrap)
     print_first_link
+    write_print_commands
     exit 0
     ;;
 esac
+
+write_print_commands
 
 while true; do
   rc=0
