@@ -9,6 +9,7 @@ SYSCTL_CONF="/etc/sysctl.d/99-live.conf"
 DOMAIN="www.microsoft.com"
 PORT="443"
 FLOW="xtls-rprx-vision"
+UPDATE_URL="https://raw.githubusercontent.com/jacksun681/live-deploy/main/live_menu.sh"
 
 [[ "$(id -u)" -ne 0 ]] && echo "请用 root 运行" && exit 1
 
@@ -44,10 +45,6 @@ ensure_conf_link() {
 
 new_uuid() {
   cat /proc/sys/kernel/random/uuid
-}
-
-new_short_id() {
-  openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | xxd -p
 }
 
 new_short_ids_json() {
@@ -102,8 +99,7 @@ pri=rs["privateKey"]
 raw=subprocess.check_output(["xray","x25519","-i",pri], text=True)
 
 pbk=""
- for_line = raw.splitlines()
-for line in for_line:
+for line in raw.splitlines():
     if ":" in line:
         k,v=line.split(":",1)
         if "Public" in k or "Password" in k:
@@ -119,8 +115,6 @@ name=urllib.parse.quote("Reality")
 print(f"vless://{uuid}@{ip}:{port}?encryption=none&security=reality&sni={sni}&fp=chrome&pbk={pbk}&sid={sid}&type=tcp&headerType=none&flow={flow}#{name}")
 PY
 EOF
-
-  sed -i 's/^ pbk/pbk/' /usr/local/bin/show_vless 2>/dev/null || true
   chmod +x /usr/local/bin/show_vless
 
   cat > /usr/local/bin/show_s5 <<'EOF'
@@ -135,7 +129,6 @@ echo "$PORT"
 echo "$USER"
 echo "$PASS"
 EOF
-
   chmod +x /usr/local/bin/show_s5
 }
 
@@ -388,7 +381,6 @@ ensure_base_config() {
     uuid="$(new_uuid)"
     shortids_json="$(new_short_ids_json)"
     write_new_config "$uuid" "$pri" "$shortids_json"
-    write_print_commands
     return
   fi
 
@@ -407,7 +399,6 @@ ensure_base_config() {
       uuid="$(new_uuid)"
       shortids_json="$(new_short_ids_json)"
       write_new_config "$uuid" "$pri" "$shortids_json"
-      write_print_commands
       return
     fi
   fi
@@ -415,15 +406,6 @@ ensure_base_config() {
   ensure_conf_link
   write_print_commands
   systemctl restart xray
-}
-
-get_private_key() {
-python3 - <<'PY'
-import json
-with open("/usr/local/etc/xray/config.json","r",encoding="utf-8") as f:
-    data=json.load(f)
-print(data["inbounds"][0]["streamSettings"]["realitySettings"].get("privateKey",""))
-PY
 }
 
 get_short_id() {
@@ -685,6 +667,24 @@ restart_xray() {
   echo "Xray 已重启"
 }
 
+update_script() {
+  echo "正在更新脚本..."
+  curl -fsSL "$UPDATE_URL" -o /usr/local/bin/live_menu.real.tmp || {
+    echo "更新失败：下载失败"
+    return 1
+  }
+
+  sed -i 's/\r$//' /usr/local/bin/live_menu.real.tmp
+  sed -i 's/www.cloudflare.com/www.microsoft.com/g' /usr/local/bin/live_menu.real.tmp
+  sed -i 's/^ for_line/for_line/' /usr/local/bin/live_menu.real.tmp 2>/dev/null || true
+
+  chmod +x /usr/local/bin/live_menu.real.tmp
+  mv /usr/local/bin/live_menu.real.tmp /usr/local/bin/live_menu.real
+
+  echo "脚本已更新"
+  bash /usr/local/bin/live_menu.real --bootstrap
+}
+
 run_s5_menu() {
   local s5_real="/usr/local/bin/live_s5.real"
   [[ -x "$s5_real" ]] || { echo "S5 工具不存在"; return 1; }
@@ -711,6 +711,7 @@ menu_ui() {
 6. 状态
 7. 重启
 8. S5 管理
+9. 更新脚本
 0. 退出
 ==============================
 EOF
@@ -725,6 +726,7 @@ EOF
     6) show_status ;;
     7) restart_xray ;;
     8) run_s5_menu; return $? ;;
+    9) update_script ;;
     0) exit 0 ;;
     *) echo "无效选项" ;;
   esac
