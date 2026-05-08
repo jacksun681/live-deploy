@@ -1,4 +1,3 @@
-cat >/root/s5.sh <<'EOF'
 #!/usr/bin/env bash
 set -u
 
@@ -30,7 +29,7 @@ get_ip() {
 need_jq() {
   command -v jq >/dev/null 2>&1 && return 0
   apt-get update -yq >/dev/null 2>&1 || true
-  apt-get install -yq jq curl >/dev/null 2>&1 || return 1
+  apt-get install -yq jq curl iproute2 >/dev/null 2>&1 || return 1
 }
 
 port_in_use() {
@@ -61,6 +60,22 @@ get_pass() {
 ensure_xray() {
   [[ -f "$XRAY_CONF" ]] || { fail "未找到 Xray 配置: $XRAY_CONF"; return 1; }
   command -v xray >/dev/null 2>&1 || { fail "未找到 xray 命令"; return 1; }
+}
+
+test_xray_config() {
+  local file="$1"
+  xray test -config "$file" >/dev/null 2>&1
+}
+
+restart_xray_with_rollback() {
+  local bak="$1"
+
+  systemctl restart "$XRAY_SERVICE" >/dev/null 2>&1 && return 0
+
+  cp "$bak" "$XRAY_CONF" 2>/dev/null || true
+  systemctl restart "$XRAY_SERVICE" >/dev/null 2>&1 || true
+  fail "Xray 重启失败，已回滚配置"
+  return 1
 }
 
 write_s5_to_xray() {
@@ -99,7 +114,7 @@ write_s5_to_xray() {
     }]
     ' "$XRAY_CONF" > "$tmp" || return 1
 
-  xray test -config "$tmp" >/dev/null 2>&1 || {
+  test_xray_config "$tmp" || {
     rm -f "$tmp"
     fail "新配置检测失败，未覆盖原配置"
     return 1
@@ -108,14 +123,7 @@ write_s5_to_xray() {
   cp "$tmp" "$XRAY_CONF" || return 1
   rm -f "$tmp"
 
-  systemctl restart "$XRAY_SERVICE" >/dev/null 2>&1 || {
-    cp "$bak" "$XRAY_CONF"
-    systemctl restart "$XRAY_SERVICE" >/dev/null 2>&1 || true
-    fail "Xray 重启失败，已回滚配置"
-    return 1
-  }
-
-  return 0
+  restart_xray_with_rollback "$bak"
 }
 
 remove_s5_from_xray() {
@@ -129,7 +137,7 @@ remove_s5_from_xray() {
     .inbounds = ((.inbounds // []) | map(select(.tag != $tag)))
   ' "$XRAY_CONF" > "$tmp" || return 1
 
-  xray test -config "$tmp" >/dev/null 2>&1 || {
+  test_xray_config "$tmp" || {
     rm -f "$tmp"
     fail "删除后配置检测失败"
     return 1
@@ -138,12 +146,7 @@ remove_s5_from_xray() {
   cp "$tmp" "$XRAY_CONF" || return 1
   rm -f "$tmp"
 
-  systemctl restart "$XRAY_SERVICE" >/dev/null 2>&1 || {
-    cp "$bak" "$XRAY_CONF"
-    systemctl restart "$XRAY_SERVICE" >/dev/null 2>&1 || true
-    fail "Xray 重启失败，已回滚配置"
-    return 1
-  }
+  restart_xray_with_rollback "$bak"
 }
 
 open_port() {
@@ -244,7 +247,7 @@ stop_s5() {
 
 menu_ui() {
   clear
-  cat <<EOF2
+  cat <<EOF
 ==============================
          S5 管理菜单
 ==============================
@@ -255,7 +258,7 @@ menu_ui() {
 5. 停止 S5
 0. 返回上级菜单
 ==============================
-EOF2
+EOF
 
   read -rp "请选择: " choice
   case "$choice" in
@@ -277,4 +280,3 @@ while true; do
   echo
   read -rp "按回车返回菜单..." _
 done
-EOF
