@@ -37,7 +37,19 @@ detect_sockd_bin() {
 }
 
 get_ip() {
-  hostname -I | awk '{print $1}'
+  local ip
+  ip="$(curl -s4 --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  [[ -z "$ip" ]] && ip="$(curl -s4 --connect-timeout 3 --max-time 5 https://ifconfig.me 2>/dev/null || true)"
+  [[ -z "$ip" ]] && ip="$(curl -s4 --connect-timeout 3 --max-time 5 https://ip.sb 2>/dev/null || true)"
+  [[ -z "$ip" ]] && ip="$(hostname -I | awk '{print $1}')"
+  echo "$ip"
+}
+
+get_iface() {
+  local iface
+  iface="$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')"
+  [[ -z "$iface" ]] && iface="eth0"
+  echo "$iface"
 }
 
 port_in_use() {
@@ -152,14 +164,14 @@ ensure_user() {
 
 write_conf() {
   local port="$1"
-  local ip
-  ip="$(get_ip)"
+  local iface
+  iface="$(get_iface)"
 
   cat > "$CONF" <<EOF
 logoutput: stderr
 
 internal: 0.0.0.0 port = ${port}
-external: ${ip}
+external: ${iface}
 
 method: username
 
@@ -237,11 +249,17 @@ close_port() {
 }
 
 print_info() {
+  local ip port
+  ip="$(get_ip)"
+  port="$(get_port)"
+
   echo
-  echo "$(get_ip)"
-  echo "$(get_port)"
+  echo "$ip"
+  echo "$port"
   echo "$DEFAULT_USER"
   echo "$DEFAULT_PASS"
+  echo
+  echo "常用格式: ${ip}:${port}:${DEFAULT_USER}:${DEFAULT_PASS}"
   echo
 }
 
