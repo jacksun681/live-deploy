@@ -8,6 +8,8 @@ PORT_FILE="/etc/xray_s5_port"
 USER_FILE="/etc/xray_s5_user"
 PASS_FILE="/etc/xray_s5_pass"
 
+SHOW_CMD="/usr/local/bin/show_s5"
+
 TAG="s5-in"
 
 DEFAULT_USER="zxwl123"
@@ -20,14 +22,17 @@ fail(){ echo "[S5] 失败: $*"; return 1; }
 
 get_ip() {
   local ip
+
   ip="$(curl -s4 --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
   [[ -z "$ip" ]] && ip="$(curl -s4 --connect-timeout 3 --max-time 5 https://ifconfig.me 2>/dev/null || true)"
   [[ -z "$ip" ]] && ip="$(curl -s4 --connect-timeout 3 --max-time 5 https://ip.sb 2>/dev/null || true)"
   [[ -z "$ip" ]] && ip="$(hostname -I | awk '{print $1}')"
+
   echo "$ip"
 }
 
 need_base() {
+
   command -v jq >/dev/null 2>&1 || {
     apt-get update -yq >/dev/null 2>&1 || true
     apt-get install -y jq curl >/dev/null 2>&1 || return 1
@@ -39,7 +44,7 @@ need_base() {
   }
 
   [[ -f "$XRAY_CONF" ]] || {
-    fail "未找到配置文件: $XRAY_CONF"
+    fail "未找到配置文件"
     return 1
   }
 
@@ -51,16 +56,19 @@ port_in_use() {
 }
 
 rand_port() {
+
   local port
+
   while true; do
     port=$((RANDOM % 50000 + 10000))
     port_in_use "$port" || break
   done
+
   echo "$port"
 }
 
 get_port() {
-  [[ -f "$PORT_FILE" ]] && cat "$PORT_FILE" || rand_port
+  [[ -f "$PORT_FILE" ]] && cat "$PORT_FILE" || echo "1080"
 }
 
 get_user() {
@@ -72,6 +80,7 @@ get_pass() {
 }
 
 open_port() {
+
   local port="$1"
 
   if command -v ufw >/dev/null 2>&1; then
@@ -81,6 +90,7 @@ open_port() {
 }
 
 close_port() {
+
   local port="$1"
 
   if command -v ufw >/dev/null 2>&1; then
@@ -90,9 +100,13 @@ close_port() {
 }
 
 backup_conf() {
+
   local bak
+
   bak="${XRAY_CONF}.bak.$(date +%s)"
+
   cp "$XRAY_CONF" "$bak"
+
   echo "$bak"
 }
 
@@ -100,7 +114,39 @@ restart_xray() {
   systemctl restart "$XRAY_SERVICE" >/dev/null 2>&1
 }
 
+rollback_conf() {
+
+  local bak="$1"
+
+  [[ -f "$bak" ]] || return 1
+
+  cp "$bak" "$XRAY_CONF"
+
+  restart_xray >/dev/null 2>&1 || true
+}
+
+write_show_cmd() {
+
+cat > "$SHOW_CMD" <<'EOF'
+#!/usr/bin/env bash
+
+IP="$(curl -s4 --connect-timeout 3 --max-time 5 https://api.ipify.org || curl -s4 --connect-timeout 3 --max-time 5 https://ifconfig.me || curl -s4 --connect-timeout 3 --max-time 5 https://ip.sb)"
+
+PORT="$(cat /etc/xray_s5_port 2>/dev/null)"
+USER="$(cat /etc/xray_s5_user 2>/dev/null || echo zxwl123)"
+PASS="$(cat /etc/xray_s5_pass 2>/dev/null || echo zxwl123)"
+
+echo "$IP"
+echo "$PORT"
+echo "$USER"
+echo "$PASS"
+EOF
+
+  chmod +x "$SHOW_CMD"
+}
+
 write_s5_inbound() {
+
   local port="$1"
   local user="$2"
   local pass="$3"
@@ -108,11 +154,11 @@ write_s5_inbound() {
   local tmp
   tmp="/tmp/xray_s5.json"
 
-  jq \
-    --arg tag "$TAG" \
-    --argjson port "$port" \
-    --arg user "$user" \
-    --arg pass "$pass" \
+jq \
+  --arg tag "$TAG" \
+  --argjson port "$port" \
+  --arg user "$user" \
+  --arg pass "$pass" \
 '
 .inbounds = ((.inbounds // []) | map(select(.tag != $tag))) |
 .inbounds += [{
@@ -134,37 +180,32 @@ write_s5_inbound() {
 ' "$XRAY_CONF" > "$tmp" || return 1
 
   cp "$tmp" "$XRAY_CONF" || return 1
+
   rm -f "$tmp"
 
   return 0
 }
 
 remove_s5_inbound() {
+
   local tmp
   tmp="/tmp/xray_s5_remove.json"
 
-  jq \
-    --arg tag "$TAG" \
+jq \
+  --arg tag "$TAG" \
 '
 .inbounds = ((.inbounds // []) | map(select(.tag != $tag)))
 ' "$XRAY_CONF" > "$tmp" || return 1
 
   cp "$tmp" "$XRAY_CONF" || return 1
+
   rm -f "$tmp"
 
   return 0
 }
 
-rollback_conf() {
-  local bak="$1"
-
-  [[ -f "$bak" ]] || return 1
-
-  cp "$bak" "$XRAY_CONF"
-  restart_xray >/dev/null 2>&1 || true
-}
-
 print_info() {
+
   local ip port user pass
 
   ip="$(get_ip)"
@@ -183,11 +224,13 @@ print_info() {
 }
 
 generate_s5() {
+
   local port user pass bak
 
   need_base || return 1
 
   port="$(get_port)"
+
   [[ "$port" =~ ^[0-9]+$ ]] || port="$(rand_port)"
 
   user="$(get_user)"
@@ -215,13 +258,17 @@ generate_s5() {
     return 1
   }
 
+  write_show_cmd
+
   open_port "$port"
 
   echo "S5 已生成完成"
+
   print_info
 }
 
 show_info() {
+
   [[ -f "$PORT_FILE" ]] || {
     echo "S5 未生成"
     return 1
@@ -231,11 +278,13 @@ show_info() {
 }
 
 change_port() {
+
   local old_port new_port user pass bak
 
   need_base || return 1
 
   old_port="$(get_port)"
+
   new_port="$(rand_port)"
 
   user="$(get_user)"
@@ -258,9 +307,13 @@ change_port() {
   }
 
   close_port "$old_port"
+
   open_port "$new_port"
 
+  write_show_cmd
+
   echo "端口已修改"
+
   print_info
 }
 
@@ -269,6 +322,7 @@ start_s5() {
 }
 
 stop_s5() {
+
   local bak
 
   need_base || return 1
@@ -291,6 +345,7 @@ stop_s5() {
 }
 
 menu_ui() {
+
   clear
 
 cat <<EOF
@@ -354,6 +409,7 @@ EOF
 }
 
 while true; do
+
   rc=0
 
   menu_ui || rc=$?
@@ -361,5 +417,7 @@ while true; do
   [[ "$rc" -eq 88 ]] && exit 88
 
   echo
+
   read -rp "按回车返回菜单..." _
+
 done
