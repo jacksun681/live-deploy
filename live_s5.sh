@@ -11,8 +11,8 @@ MANUAL_STOP_FLAG="/tmp/s5_manual_stop"
 [[ "$(id -u)" -ne 0 ]] && echo "请用 root 运行" && exit 1
 
 log() { echo "[S5] $*"; }
-fail() { echo "[S5] 失败: $*"; return 1; }
 
+# 1. 极速公网 IP 获取逻辑 (解决 10.x 内网 IP 问题)
 get_ip() {
   local ip
   ip=$(curl -s4 --connect-timeout 5 https://api.ipify.org || \
@@ -22,64 +22,54 @@ get_ip() {
   echo "$ip"
 }
 
-detect_sockd_bin() {
-  local p
-  p="$(command -v sockd 2>/dev/null || true)"
-  if [[ -n "${p:-}" && -x "$p" ]]; then echo "$p"; return 0; fi
-  for p in /usr/sbin/sockd /usr/local/sbin/sockd; do [[ -x "$p" ]] && { echo "$p"; return 0; }; done
-  return 1
-}
-
-# 终极安装逻辑：尝试多源极速安装，失败则尝试源码救急
+# 2. 针对 Debian 12 的极速安装
 ensure_sockd() {
-  detect_sockd_bin >/dev/null 2>&1 && return 0
-
-  log "正在启动极速部署模式..."
-  local ARCH
-  ARCH=$(dpkg --print-architecture)
+  if command -v sockd >/dev/null 2>&1; then return 0; fi
   
-  # 多备选源：中科大、清华、Debian官方、GitHub镜像
-  local URLS=(
-    "https://mirrors.ustc.edu.cn/debian/pool/main/d/dante/dante-server_1.4.2+dfsg-10_${ARCH}.deb"
-    "http://ftp.cn.debian.org/debian/pool/main/d/dante/dante-server_1.4.2+dfsg-10_${ARCH}.deb"
-    "http://http.us.debian.org/debian/pool/main/d/dante/dante-server_1.4.2+dfsg-10_${ARCH}.deb"
-  )
-
-  local success=false
-  for url in "${URLS[@]}"; do
-    log "正在从源获取预编译包..."
-    if curl -L --connect-timeout 8 --max-time 30 "$url" -o /tmp/dante.deb && [ -s /tmp/dante.deb ]; then
-      # 检查文件头是否正确，防止下载到错误的HTML
-      if file /tmp/dante.deb 2>/dev/null | grep -q "Debian binary package"; then
-        dpkg -i /tmp/dante.deb || apt-get install -f -y >/dev/null 2>&1
-        rm -f /tmp/dante.deb
-        success=true
-        break
-      fi
-    fi
-    rm -f /tmp/dante.deb
-  done
-
-  if [ "$success" = false ]; then
-    log "极速模式受阻，尝试标准 apt 安装..."
-    apt-get update -yq >/dev/null 2>&1 || true
-    apt-get install -yq dante-server >/dev/null 2>&1
-  fi
-
-  detect_sockd_bin >/dev/null 2>&1 || return 1
+  log "正在通过系统仓库极速安装..."
+  # 因为你手动执行 apt 已经成功，这里直接调用系统安装即可
+  apt-get update -yq >/dev/null 2>&1
+  apt-get install -yq dante-server >/dev/null 2>&1
+  
+  command -v sockd >/dev/null 2>&1 || return 1
 }
 
-ensure_user() {
-  if ! id "$DEFAULT_USER" >/dev/null 2>&1; then
-    useradd -M -s /usr/sbin/nologin "$DEFAULT_USER" >/dev/null 2>&1 || true
-  fi
-  echo "${DEFAULT_USER}:${DEFAULT_PASS}" | chpasswd >/dev/null 2>&1 || return 1
+# 3. 端口管理
+port_in_use() { ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$1$"; }
+rand_port() {
+  local port
+  while true; do port=$((RANDOM % 50000 + 10000)); port_in_use "$port" || break; done
+  echo "$port"
+}
+get_port() { [[ -f "$PORT_FILE" ]] && cat "$PORT_FILE" || rand_port; }
+
+# 4. 精准对齐你的图片输出格式
+print_info() {
+  local ip=$(get_ip)
+  local port=$(get_port)
+  echo "--- S5 连接信息 ---"
+  echo "$ip"
+  echo "$port"
+  echo "$DEFAULT_USER"
+  echo "$DEFAULT_PASS"
+  echo "格式：$ip:$port:$DEFAULT_USER:$DEFAULT_PASS"
+  echo
 }
 
-write_conf() {
-  local port="$1"
-  local ip
-  ip="$(get_ip)"
+# 5. 生成/修复核心逻辑
+generate_s5() {
+  local port=$(get_port)
+  echo "$port" > "$PORT_FILE"
+  
+  log "检查环境与安装 sockd..."
+  ensure_sockd || { echo "安装失败，请手动运行 apt install dante-server"; return 1; }
+  
+  # 写入账号
+  id "$DEFAULT_USER" &>/dev/null || useradd -M -s /usr/sbin/nologin "$DEFAULT_USER"
+  echo "${DEFAULT_USER}:${DEFAULT_PASS}" | chpasswd
+  
+  # 写入配置 (使用识别到的公网 IP)
+  local ip=$(get_ip)
   cat > "$CONF" <<EOF
 logoutput: stderr
 internal: 0.0.0.0 port = ${port}
@@ -90,11 +80,9 @@ user.unprivileged: nobody
 client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
 pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp udp }
 EOF
-}
 
-write_service() {
-  local sockd_bin
-  sockd_bin="$(detect_sockd_bin)" || return 1
+  # 写入服务并启动
+  local sockd_bin=$(command -v sockd || echo "/usr/sbin/sockd")
   cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
 [Unit]
 Description=S5 Proxy
@@ -102,62 +90,22 @@ After=network.target
 [Service]
 ExecStart=${sockd_bin} -f ${CONF}
 Restart=always
-RestartSec=2
 LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+
   systemctl daemon-reload
-}
-
-port_in_use() { ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$1$"; }
-rand_port() {
-  local port
-  while true; do port=$((RANDOM % 50000 + 10000)); port_in_use "$port" || break; done
-  echo "$port"
-}
-get_port() { [[ -f "$PORT_FILE" ]] && cat "$PORT_FILE" || rand_port; }
-
-# 精准输出格式对齐
-print_info() {
-  local ip=$(get_ip)
-  local port=$(get_port)
-  echo "--- S5 连接信息 ---"
-  echo "$ip"
-  echo "$port"
-  echo "$DEFAULT_USER"
-  echo "$DEFAULT_PASS"
-  
-  echo "格式：$ip:$port:$DEFAULT_USER:$DEFAULT_PASS"
-  echo
-}
-
-generate_s5() {
-  local port=$(get_port)
-  echo "$port" > "$PORT_FILE"
-  
-  log "检查环境与安装 sockd..."
-  ensure_sockd || { fail "安装失败，请尝试重启或手动运行 apt install dante-server"; return 1; }
-  
-  log "写入账号..."
-  ensure_user
-  
-  log "写入配置..."
-  write_conf "$port"
-  
-  log "写入服务..."
-  write_service
-  
-  rm -f "$MANUAL_STOP_FLAG"
-  log "启动服务..."
-  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+  systemctl enable "$SERVICE" &>/dev/null
   systemctl restart "$SERVICE"
+  rm -f "$MANUAL_STOP_FLAG"
   
   echo "S5 已生成完成"
   echo
   print_info
 }
 
+# 菜单 UI
 menu_ui() {
   clear
   cat <<EOF
@@ -179,9 +127,7 @@ EOF
     3) 
        new_port=$(rand_port)
        echo "$new_port" > "$PORT_FILE"
-       write_conf "$new_port"
-       systemctl restart "$SERVICE" 2>/dev/null || echo "Failed to restart s5.service"
-       print_info 
+       generate_s5
        ;;
     4) rm -f "$MANUAL_STOP_FLAG"; systemctl start "$SERVICE"; print_info ;;
     5) touch "$MANUAL_STOP_FLAG"; systemctl stop "$SERVICE"; echo "S5 已停止" ;;
@@ -189,4 +135,4 @@ EOF
   esac
 }
 
-while true; do menu_ui; read -rp "按回车返回菜单..." _; done
+while true; do menu_ui; read -rp "按回车继续..." _; done
