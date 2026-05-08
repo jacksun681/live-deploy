@@ -31,7 +31,12 @@ detect_sockd_bin() {
 }
 
 get_ip() {
-  hostname -I | awk '{print $1}'
+  local ip
+  ip="$(curl -s4 --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  [[ -z "$ip" ]] && ip="$(curl -s4 --connect-timeout 3 --max-time 5 https://ifconfig.me 2>/dev/null || true)"
+  [[ -z "$ip" ]] && ip="$(curl -s4 --connect-timeout 3 --max-time 5 https://ip.sb 2>/dev/null || true)"
+  [[ -z "$ip" ]] && ip="$(hostname -I | awk '{print $1}')"
+  echo "$ip"
 }
 
 port_in_use() {
@@ -52,7 +57,7 @@ get_port() {
   [[ -f "$PORT_FILE" ]] && cat "$PORT_FILE" || rand_port
 }
 
-ensure_basic_tools() {
+ensure_base_tools() {
   command -v curl >/dev/null 2>&1 || {
     apt-get update -yq >/dev/null 2>&1 || true
     apt-get install -yq curl >/dev/null 2>&1 || true
@@ -64,7 +69,98 @@ ensure_basic_tools() {
   }
 }
 
-ensure_deps() {
+install_sockd_by_apt() {
+  apt-get install -yq dante-server >/dev/null 2>&1
+  detect_sockd_bin >/dev/null 2>&1 && return 0
+
+  apt-get update -yq >/dev/null 2>&1 || true
+  apt-get install -yq dante-server >/dev/null 2>&1
+  detect_sockd_bin >/dev/null 2>&1
+}
+
+get_os_info() {
+  OS_ID=""
+  OS_CODENAME=""
+  [[ -f /etc/os-release ]] || return 1
+  . /etc/os-release
+  OS_ID="${ID:-}"
+  OS_CODENAME="${VERSION_CODENAME:-}"
+  [[ -n "$OS_ID" && -n "$OS_CODENAME" ]]
+}
+
+write_debian_source() {
+  local mirror="$1"
+  local codename="$2"
+
+  cp /etc/apt/sources.list "/etc/apt/sources.list.bak.s5.$(date +%s)" 2>/dev/null || true
+
+  cat > /etc/apt/sources.list <<EOF
+deb ${mirror}/debian ${codename} main contrib non-free non-free-firmware
+deb ${mirror}/debian ${codename}-updates main contrib non-free non-free-firmware
+deb ${mirror}/debian-security ${codename}-security main contrib non-free non-free-firmware
+EOF
+}
+
+write_ubuntu_source() {
+  local mirror="$1"
+  local codename="$2"
+
+  cp /etc/apt/sources.list "/etc/apt/sources.list.bak.s5.$(date +%s)" 2>/dev/null || true
+
+  cat > /etc/apt/sources.list <<EOF
+deb ${mirror}/ubuntu ${codename} main restricted universe multiverse
+deb ${mirror}/ubuntu ${codename}-updates main restricted universe multiverse
+deb ${mirror}/ubuntu ${codename}-security main restricted universe multiverse
+EOF
+}
+
+install_sockd_by_multi_source() {
+  local mirrors os codename mirror
+
+  get_os_info || return 1
+  os="$OS_ID"
+  codename="$OS_CODENAME"
+
+  if [[ "$os" == "debian" ]]; then
+    mirrors=(
+      "http://deb.debian.org"
+      "http://mirrors.aliyun.com"
+      "http://mirrors.tencent.com"
+      "https://mirrors.tuna.tsinghua.edu.cn"
+      "https://mirrors.ustc.edu.cn"
+    )
+
+    for mirror in "${mirrors[@]}"; do
+      log "切换 Debian 源: $mirror"
+      write_debian_source "$mirror" "$codename"
+      apt-get clean >/dev/null 2>&1 || true
+      apt-get update -yq >/dev/null 2>&1 || true
+      apt-get install -yq dante-server >/dev/null 2>&1 || true
+      detect_sockd_bin >/dev/null 2>&1 && return 0
+    done
+  elif [[ "$os" == "ubuntu" ]]; then
+    mirrors=(
+      "http://archive.ubuntu.com"
+      "http://mirrors.aliyun.com"
+      "http://mirrors.tencent.com"
+      "https://mirrors.tuna.tsinghua.edu.cn"
+      "https://mirrors.ustc.edu.cn"
+    )
+
+    for mirror in "${mirrors[@]}"; do
+      log "切换 Ubuntu 源: $mirror"
+      write_ubuntu_source "$mirror" "$codename"
+      apt-get clean >/dev/null 2>&1 || true
+      apt-get update -yq >/dev/null 2>&1 || true
+      apt-get install -yq dante-server >/dev/null 2>&1 || true
+      detect_sockd_bin >/dev/null 2>&1 && return 0
+    done
+  fi
+
+  return 1
+}
+
+ensure_deps_for_source() {
   apt-get update -yq >/dev/null 2>&1 || true
   apt-get install -yq wget curl tar make gcc build-essential iproute2 passwd cron >/dev/null 2>&1 || return 1
   return 0
@@ -74,14 +170,13 @@ download_with_retry() {
   local out="$1"
   shift
   local urls=("$@")
-  local url
-  local tries
+  local url tries
 
   rm -f "$out"
 
   for url in "${urls[@]}"; do
     for tries in 1 2 3; do
-      log "下载: $url (第 ${tries} 次)"
+      log "下载源码包: $url (第 ${tries} 次)"
       curl -L --connect-timeout 15 --max-time 120 -o "$out" "$url" >/dev/null 2>&1 || true
 
       if [[ -s "$out" ]] && tar -tzf "$out" >/dev/null 2>&1; then
@@ -96,53 +191,10 @@ download_with_retry() {
   return 1
 }
 
-install_sockd_by_apt() {
-  apt-get install -yq dante-server >/dev/null 2>&1 && detect_sockd_bin >/dev/null 2>&1 && return 0
-
-  apt-get update -yq >/dev/null 2>&1 || true
-  apt-get install -yq dante-server >/dev/null 2>&1 || return 1
-
-  detect_sockd_bin >/dev/null 2>&1
-}
-
-install_sockd_by_deb_pool() {
-  ensure_basic_tools
-
-  command -v curl >/dev/null 2>&1 || return 1
-
-  local arch
-  local index
-  local deb_name
-  local deb_url
-
-  arch="$(dpkg --print-architecture 2>/dev/null || true)"
-  [[ -n "$arch" ]] || return 1
-
-  log "尝试官方预编译包安装..."
-
-  index="$(curl -fsSL --connect-timeout 10 --max-time 30 https://ftp.debian.org/debian/pool/main/d/dante/ 2>/dev/null || true)"
-  [[ -n "$index" ]] || return 1
-
-  deb_name="$(echo "$index" \
-    | grep -oE "dante-server_[^\"]+_${arch}\.deb" \
-    | sort -V \
-    | tail -n 1)"
-
-  [[ -n "$deb_name" ]] || return 1
-
-  deb_url="https://ftp.debian.org/debian/pool/main/d/dante/${deb_name}"
-
-  log "下载预编译包: $deb_name"
-  curl -L --connect-timeout 10 --max-time 80 "$deb_url" -o /tmp/dante-server.deb >/dev/null 2>&1 || return 1
-
-  dpkg -i /tmp/dante-server.deb >/dev/null 2>&1 || apt-get install -f -yq >/dev/null 2>&1
-  rm -f /tmp/dante-server.deb
-
-  detect_sockd_bin >/dev/null 2>&1
-}
-
 install_sockd_by_source() {
-  ensure_deps || return 1
+  log "最后尝试源码编译，可能需要数分钟..."
+
+  ensure_deps_for_source || return 1
 
   cd /root || return 1
   rm -rf "$SRC_DIR" "$SRC_TAR"
@@ -166,26 +218,22 @@ install_sockd_by_source() {
 ensure_sockd() {
   detect_sockd_bin >/dev/null 2>&1 && return 0
 
-  log "检查/安装 dante-server..."
+  ensure_base_tools
 
-  if install_sockd_by_apt; then
-    return 0
-  fi
+  log "尝试系统源快速安装..."
+  install_sockd_by_apt && return 0
 
-  if install_sockd_by_deb_pool; then
-    return 0
-  fi
+  log "系统源安装失败，尝试多源自动切换..."
+  install_sockd_by_multi_source && return 0
 
-  log "预编译安装失败，尝试源码编译..."
-  if install_sockd_by_source; then
-    return 0
-  fi
+  log "多源安装失败，进入源码编译兜底..."
+  install_sockd_by_source && return 0
 
   return 1
 }
 
 ensure_user() {
-  useradd -M -s /usr/sbin/nologin "$DEFAULT_USER" >/dev/null 2>&1 || true
+  id "$DEFAULT_USER" >/dev/null 2>&1 || useradd -M -s /usr/sbin/nologin "$DEFAULT_USER" >/dev/null 2>&1 || true
   echo "${DEFAULT_USER}:${DEFAULT_PASS}" | chpasswd >/dev/null 2>&1 || return 1
 }
 
@@ -200,7 +248,7 @@ logoutput: stderr
 internal: 0.0.0.0 port = ${port}
 external: ${ip}
 
-method: username
+socksmethod: username
 
 user.privileged: root
 user.unprivileged: nobody
@@ -209,7 +257,7 @@ client pass {
     from: 0.0.0.0/0 to: 0.0.0.0/0
 }
 
-pass {
+socks pass {
     from: 0.0.0.0/0 to: 0.0.0.0/0
     protocol: tcp udp
 }
@@ -306,8 +354,11 @@ show_error_hint() {
   echo
   echo "[提示] 可执行以下命令排查："
   echo "which sockd"
+  echo "apt update -y && apt install -y dante-server"
   echo "systemctl status s5 --no-pager -l"
   echo "journalctl -u s5 -n 50 --no-pager"
+  echo "cat /tmp/dante-configure.log"
+  echo "cat /tmp/dante-make.log"
   echo
 }
 
