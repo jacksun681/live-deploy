@@ -17,12 +17,6 @@ SRC_TAR="/root/dante-1.4.2.tar.gz"
 log() { echo "[S5] $*"; }
 fail() { echo "[S5] 失败: $*"; return 1; }
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 && return 0
-  apt-get update -yq >/dev/null 2>&1 || true
-  apt-get install -yq "$2" >/dev/null 2>&1 || return 1
-}
-
 detect_sockd_bin() {
   local p
   p="$(command -v sockd 2>/dev/null || true)"
@@ -58,16 +52,21 @@ get_port() {
   [[ -f "$PORT_FILE" ]] && cat "$PORT_FILE" || rand_port
 }
 
+ensure_basic_tools() {
+  command -v curl >/dev/null 2>&1 || {
+    apt-get update -yq >/dev/null 2>&1 || true
+    apt-get install -yq curl >/dev/null 2>&1 || true
+  }
+
+  command -v ss >/dev/null 2>&1 || {
+    apt-get update -yq >/dev/null 2>&1 || true
+    apt-get install -yq iproute2 >/dev/null 2>&1 || true
+  }
+}
+
 ensure_deps() {
-  need_cmd wget wget || return 1
-  need_cmd curl curl || return 1
-  need_cmd tar tar || return 1
-  need_cmd make build-essential || return 1
-  need_cmd gcc build-essential || return 1
-  need_cmd ss iproute2 || return 1
-  need_cmd useradd passwd || return 1
-  need_cmd chpasswd passwd || return 1
-  need_cmd crontab cron || true
+  apt-get update -yq >/dev/null 2>&1 || true
+  apt-get install -yq wget curl tar make gcc build-essential iproute2 passwd cron >/dev/null 2>&1 || return 1
   return 0
 }
 
@@ -83,11 +82,7 @@ download_with_retry() {
   for url in "${urls[@]}"; do
     for tries in 1 2 3; do
       log "下载: $url (第 ${tries} 次)"
-      if command -v curl >/dev/null 2>&1; then
-        curl -L --connect-timeout 15 --max-time 120 -o "$out" "$url" >/dev/null 2>&1 || true
-      else
-        wget -O "$out" "$url" >/dev/null 2>&1 || true
-      fi
+      curl -L --connect-timeout 15 --max-time 120 -o "$out" "$url" >/dev/null 2>&1 || true
 
       if [[ -s "$out" ]] && tar -tzf "$out" >/dev/null 2>&1; then
         return 0
@@ -102,8 +97,47 @@ download_with_retry() {
 }
 
 install_sockd_by_apt() {
+  apt-get install -yq dante-server >/dev/null 2>&1 && detect_sockd_bin >/dev/null 2>&1 && return 0
+
   apt-get update -yq >/dev/null 2>&1 || true
   apt-get install -yq dante-server >/dev/null 2>&1 || return 1
+
+  detect_sockd_bin >/dev/null 2>&1
+}
+
+install_sockd_by_deb_pool() {
+  ensure_basic_tools
+
+  command -v curl >/dev/null 2>&1 || return 1
+
+  local arch
+  local index
+  local deb_name
+  local deb_url
+
+  arch="$(dpkg --print-architecture 2>/dev/null || true)"
+  [[ -n "$arch" ]] || return 1
+
+  log "尝试官方预编译包安装..."
+
+  index="$(curl -fsSL --connect-timeout 10 --max-time 30 https://ftp.debian.org/debian/pool/main/d/dante/ 2>/dev/null || true)"
+  [[ -n "$index" ]] || return 1
+
+  deb_name="$(echo "$index" \
+    | grep -oE "dante-server_[^\"]+_${arch}\.deb" \
+    | sort -V \
+    | tail -n 1)"
+
+  [[ -n "$deb_name" ]] || return 1
+
+  deb_url="https://ftp.debian.org/debian/pool/main/d/dante/${deb_name}"
+
+  log "下载预编译包: $deb_name"
+  curl -L --connect-timeout 10 --max-time 80 "$deb_url" -o /tmp/dante-server.deb >/dev/null 2>&1 || return 1
+
+  dpkg -i /tmp/dante-server.deb >/dev/null 2>&1 || apt-get install -f -yq >/dev/null 2>&1
+  rm -f /tmp/dante-server.deb
+
   detect_sockd_bin >/dev/null 2>&1
 }
 
@@ -132,12 +166,17 @@ install_sockd_by_source() {
 ensure_sockd() {
   detect_sockd_bin >/dev/null 2>&1 && return 0
 
-  log "尝试通过 apt 安装 dante-server..."
+  log "检查/安装 dante-server..."
+
   if install_sockd_by_apt; then
     return 0
   fi
 
-  log "apt 安装失败，尝试源码编译..."
+  if install_sockd_by_deb_pool; then
+    return 0
+  fi
+
+  log "预编译安装失败，尝试源码编译..."
   if install_sockd_by_source; then
     return 0
   fi
@@ -237,11 +276,17 @@ close_port() {
 }
 
 print_info() {
+  local ip port
+  ip="$(get_ip)"
+  port="$(get_port)"
+
   echo
-  echo "$(get_ip)"
-  echo "$(get_port)"
+  echo "$ip"
+  echo "$port"
   echo "$DEFAULT_USER"
   echo "$DEFAULT_PASS"
+  echo
+  echo "常用格式: ${ip}:${port}:${DEFAULT_USER}:${DEFAULT_PASS}"
   echo
 }
 
