@@ -158,10 +158,10 @@ self_check() {
 
 print_info() {
   echo -e "\n--- S5 连接信息 ---"
-  echo "IP:   $(get_ip)"
-  echo "端口: $(get_port)"
-  echo "账号: $DEFAULT_USER"
-  echo "密码: $DEFAULT_PASS"
+  echo " $(get_ip)"
+  echo " $(get_port)"
+  echo " $DEFAULT_USER"
+  echo " $DEFAULT_PASS"
   echo -e "格式: $(get_ip):$(get_port):$DEFAULT_USER:$DEFAULT_PASS\n"
 }
 
