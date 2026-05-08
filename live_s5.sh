@@ -12,7 +12,7 @@ MANUAL_STOP_FLAG="/tmp/s5_manual_stop"
 
 log() { echo "[S5] $*"; }
 
-# 1. 强制获取真实公网 IP
+# 1. 强制获取真实公网 IP (解决 10.11.x.x 问题)
 get_ip() {
   local ip
   ip=$(curl -s4 --connect-timeout 5 https://api.ipify.org || \
@@ -22,39 +22,31 @@ get_ip() {
   echo "$ip"
 }
 
-# 2. 针对 Debian 13 (Trixie) 的兼容性安装逻辑
+# 2. 针对 Debian 13 的编译安装逻辑 (跳过寻找 deb 包)
 ensure_sockd() {
   if command -v sockd >/dev/null 2>&1; then return 0; fi
   
-  log "检测到 Debian 13 环境，正在修复仓库依赖..."
-  
-  # 尝试直接安装
+  log "检测到 Debian 13 环境，正在准备编译环境 (约需 1-2 分钟)..."
   apt-get update -yq >/dev/null 2>&1
-  if ! apt-get install -yq dante-server >/dev/null 2>&1; then
-    log "官方仓库暂无此包，正在尝试跨版本兼容安装..."
-    # 临时添加 Debian 12 仓库来获取 dante-server
-    echo "deb http://deb.debian.org/debian bookworm main" > /etc/apt/sources.list.d/temp_bkw.list
-    apt-get update -yq >/dev/null 2>&1
-    apt-get install -yq dante-server >/dev/null 2>&1
-    rm -f /etc/apt/sources.list.d/temp_bkw.list
-    apt-get update -yq >/dev/null 2>&1
-  fi
+  apt-get install -yq build-essential libwrap0-dev libpam0g-dev libkrb5-dev libsasl2-dev curl >/dev/null 2>&1
   
+  log "正在下载并编译 Dante 1.4.2..."
+  cd /tmp
+  curl -L -O https://www.inet.no/dante/files/dante-1.4.2.tar.gz
+  tar -zxf dante-1.4.2.tar.gz
+  cd dante-1.4.2
+  ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var --libdir=/usr/lib >/dev/null 2>&1
+  make -j$(nproc) >/dev/null 2>&1
+  make install >/dev/null 2>&1
+  
+  cd /tmp && rm -rf dante-1.4.2*
   command -v sockd >/dev/null 2>&1 || return 1
 }
 
-port_in_use() { ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$1$"; }
-rand_port() {
-  local port
-  while true; do port=$((RANDOM % 50000 + 10000)); port_in_use "$port" || break; done
-  echo "$port"
-}
-get_port() { [[ -f "$PORT_FILE" ]] && cat "$PORT_FILE" || rand_port; }
-
-# 3. 精准对齐图片输出格式
+# 3. 输出格式对齐
 print_info() {
   local ip=$(get_ip)
-  local port=$(get_port)
+  local port=$(cat "$PORT_FILE" 2>/dev/null || echo "1080")
   echo "--- S5 连接信息 ---"
   echo "$ip"
   echo "$port"
@@ -64,19 +56,19 @@ print_info() {
   echo
 }
 
-# 4. 生成/修复核心逻辑
+# 4. 生成与配置核心逻辑
 generate_s5() {
-  local port=$(get_port)
-  echo "$port" > "$PORT_FILE"
+  local port
+  if [[ -f "$PORT_FILE" ]]; then port=$(cat "$PORT_FILE"); else port=$((RANDOM % 50000 + 10000)); echo "$port" > "$PORT_FILE"; fi
   
-  log "检查环境与安装工具..."
-  ensure_sockd || { echo "安装失败：Debian 13 仓库尚未准备就绪"; return 1; }
+  log "检查环境与编译安装 sockd..."
+  ensure_sockd || { echo "编译安装失败，请检查网络或联系支持"; return 1; }
   
-  # 写入账号
+  # 账号处理
   id "$DEFAULT_USER" &>/dev/null || useradd -M -s /usr/sbin/nologin "$DEFAULT_USER"
   echo "${DEFAULT_USER}:${DEFAULT_PASS}" | chpasswd
-  
-  # 写入配置
+
+  # 写入配置 (使用识别到的公网 IP)
   local ip=$(get_ip)
   cat > "$CONF" <<EOF
 logoutput: stderr
@@ -131,15 +123,11 @@ EOF
   case "$choice" in
     1) generate_s5 ;;
     2) [[ -f "$PORT_FILE" ]] && print_info || echo "S5 未生成" ;;
-    3) 
-       new_port=$(rand_port)
-       echo "$new_port" > "$PORT_FILE"
-       generate_s5
-       ;;
+    3) rm -f "$PORT_FILE"; generate_s5 ;;
     4) rm -f "$MANUAL_STOP_FLAG"; systemctl start "$SERVICE"; print_info ;;
     5) touch "$MANUAL_STOP_FLAG"; systemctl stop "$SERVICE"; echo "S5 已停止" ;;
     0) exit 88 ;;
   esac
 }
 
-while true; do menu_ui; read -rp "按回车返回菜单..." _; done
+while true; do menu_ui; read -rp "按回车继续..." _; done
