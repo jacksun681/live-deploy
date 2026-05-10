@@ -311,7 +311,6 @@ PY
 
   ln -sf "$CONF" "$ETC_CONF"
 }
-
 restart_xray() {
   systemctl enable xray >/dev/null 2>&1 || true
   systemctl restart xray
@@ -582,25 +581,22 @@ bootstrap() {
 menu_ui() {
   clear
 
-  echo "===================================="
-  echo
-  echo "        node 管理菜单"
-  echo "         $(get_ip)"
-  echo
-  echo "===================================="
-  echo
-  echo "1. 查看全部链接"
-  echo "2. 新增 VLESS"
-  echo "3. 重置 VLESS"
-  echo "4. 删除 VLESS"
-  echo "5. 重置 VMess"
-  echo "6. 重置 S5"
-  echo "7. 更新脚本"
-  echo "8. 卸载配置"
-  echo "0. 退出"
-  echo
-  echo "------------------------------------"
-  echo
+  cat <<EOF
+==============================
+   Xray 综合管理菜单 | IP: $(get_ip)
+==============================
+1. 修复/初始化
+2. 查看全部链接
+3. 新增 VLESS
+4. 重置 VLESS
+5. 删除 VLESS
+6. 重置 VMess
+7. 重置 S5
+8. 更新脚本
+9. 卸载配置
+0. 退出
+==============================
+EOF
 
   read -rp "请选择: " choice
 
