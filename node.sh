@@ -34,6 +34,7 @@ need_cmd() {
 
 install_deps() {
   need_cmd curl curl
+  need_cmd update-ca-certificates ca-certificates
   need_cmd openssl openssl
   need_cmd jq jq
   need_cmd ss iproute2
