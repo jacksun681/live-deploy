@@ -459,10 +459,9 @@ menu() {
   load_info
   clear
 
-  echo -e "${green}==========================================${plain}"
-  echo "            node 管理菜单"
-  echo "               $(get_ip)"
-  echo -e "${green}==========================================${plain}"
+echo -e "${green}==========================================${plain}"
+echo "        node 管理菜单 | IP: $(get_ip)"
+echo -e "${green}==========================================${plain}"
   echo "1. 查看所有链接"
   echo "2. 新增 VLESS"
   echo "3. 重置 VLESS"
