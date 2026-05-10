@@ -11,16 +11,16 @@ CMD="/usr/local/bin/node"
 SYSCTL_CONF="/etc/sysctl.d/99-node.conf"
 UPDATE_URL="https://raw.githubusercontent.com/jacksun681/live-deploy/main/node.sh"
 
+V_PORT="443"
 SNI="www.microsoft.com"
 DEST="www.microsoft.com:443"
 FP="chrome"
 FLOW="xtls-rprx-vision"
+
 S_USER="zxwl123"
 S_PASS="zxwl123"
 
 green="\033[32m"
-yellow="\033[33m"
-red="\033[31m"
 plain="\033[0m"
 
 [[ "$(id -u)" -ne 0 ]] && echo "请用 root 运行" && exit 1
@@ -28,10 +28,7 @@ plain="\033[0m"
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     apt-get update -yq
-    apt-get install -yq \
-      -o Dpkg::Options::="--force-confdef" \
-      -o Dpkg::Options::="--force-confold" \
-      "$2"
+    apt-get install -yq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" "$2"
   }
 }
 
@@ -42,20 +39,18 @@ install_deps() {
   need_cmd ss iproute2
   need_cmd ip iproute2
   need_cmd python3 python3
+  need_cmd awk gawk
 }
 
 install_xray() {
-  if ! command -v xray >/dev/null 2>&1; then
+  command -v xray >/dev/null 2>&1 || \
     bash <(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh) install
-  fi
 }
 
 get_ip() {
-  local ip
-  ip="$(curl -4 -s --connect-timeout 3 --max-time 5 https://api.ipify.org || true)"
-  [[ -z "$ip" ]] && ip="$(curl -4 -s --connect-timeout 3 --max-time 5 https://ifconfig.me || true)"
-  [[ -z "$ip" ]] && ip="$(hostname -I | awk '{print $1}')"
-  echo "$ip"
+  curl -4 -s --connect-timeout 3 --max-time 5 https://api.ipify.org || \
+  curl -4 -s --connect-timeout 3 --max-time 5 https://ifconfig.me || \
+  hostname -I | awk '{print $1}'
 }
 
 rand_port() {
@@ -101,12 +96,14 @@ net.core.netdev_max_backlog=250000
 net.ipv4.tcp_max_syn_backlog=8192
 net.ipv4.tcp_fin_timeout=15
 net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_keepalive_time=300
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=5
 net.ipv6.conf.all.disable_ipv6=1
 net.ipv6.conf.default.disable_ipv6=1
 EOF
 
   sysctl --system >/dev/null 2>&1 || true
-
   local iface
   iface="$(ip route | awk '/default/ {print $5; exit}')"
   [[ -n "${iface:-}" ]] && tc qdisc replace dev "$iface" root fq >/dev/null 2>&1 || true
@@ -114,29 +111,35 @@ EOF
 
 load_info() {
   if [[ -f "$INFO" ]]; then
-    # shellcheck disable=SC1090
     source "$INFO"
   else
-    V_PORTS=()
     V_IDS=()
-    V_PRI_KEYS=()
-    V_PUB_KEYS=()
     V_NAMES=()
+    M_PORT=0
+    M_ID=""
     S_PORT=0
     SID="$(new_sid)"
+    KEYS="$(make_keys)"
+    V_PRI="${KEYS%%|*}"
+    V_PUB="${KEYS##*|}"
   fi
 }
 
 save_info() {
   cat > "$INFO" <<EOF
-V_PORTS=(${V_PORTS[*]})
 V_IDS=(${V_IDS[*]})
-V_PRI_KEYS=(${V_PRI_KEYS[*]})
-V_PUB_KEYS=(${V_PUB_KEYS[*]})
 V_NAMES=(${V_NAMES[*]})
+V_PORT="$V_PORT"
+V_PRI="$V_PRI"
+V_PUB="$V_PUB"
+
+M_PORT=$M_PORT
+M_ID="$M_ID"
+
 S_PORT=$S_PORT
 S_USER="$S_USER"
 S_PASS="$S_PASS"
+
 SNI="$SNI"
 DEST="$DEST"
 FP="$FP"
@@ -146,22 +149,21 @@ EOF
 }
 
 ensure_first_vless() {
-  if [[ "${#V_PORTS[@]}" -eq 0 ]]; then
-    local keys pri pub
-    keys="$(make_keys)"
-    pri="${keys%%|*}"
-    pub="${keys##*|}"
-
-    V_PORTS+=("$(rand_port)")
+  if [[ "${#V_IDS[@]}" -eq 0 ]]; then
     V_IDS+=("$(new_uuid)")
-    V_PRI_KEYS+=("$pri")
-    V_PUB_KEYS+=("$pub")
     V_NAMES+=("vless1")
   fi
 }
 
+ensure_vmess() {
+  if [[ "${M_PORT:-0}" -eq 0 ]]; then
+    M_PORT="$(rand_port)"
+    M_ID="$(new_uuid)"
+  fi
+}
+
 ensure_s5() {
-  if [[ "${S_PORT:-0}" -le 0 ]]; then
+  if [[ "${S_PORT:-0}" -eq 0 ]]; then
     S_PORT="$(rand_port)"
   fi
 }
@@ -172,51 +174,72 @@ write_config() {
   python3 - "$CONF" <<PY
 import json
 
-conf_path = "$CONF"
+conf_path="$CONF"
 
-v_ports = "${V_PORTS[*]}".split()
-v_ids = "${V_IDS[*]}".split()
-v_pris = "${V_PRI_KEYS[*]}".split()
-s_port = int("$S_PORT")
+v_ids="${V_IDS[*]}".split()
+v_port=int("$V_PORT")
+v_pri="$V_PRI"
 
-sni = "$SNI"
-dest = "$DEST"
-sid = "$SID"
-flow = "$FLOW"
-s_user = "$S_USER"
-s_pass = "$S_PASS"
+m_port=int("$M_PORT")
+m_id="$M_ID"
+s_port=int("$S_PORT")
 
-inbounds = []
+s_user="$S_USER"
+s_pass="$S_PASS"
+sni="$SNI"
+dest="$DEST"
+sid="$SID"
+flow="$FLOW"
 
-for i, port in enumerate(v_ports):
+clients=[]
+for i,uid in enumerate(v_ids):
+    clients.append({
+        "id": uid,
+        "flow": flow,
+        "email": f"user{i+1}"
+    })
+
+inbounds=[]
+
+inbounds.append({
+    "port": v_port,
+    "protocol": "vless",
+    "settings": {
+        "clients": clients,
+        "decryption": "none"
+    },
+    "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "sockopt": {
+            "tcpKeepAliveIdle": 300,
+            "tcpKeepAliveInterval": 30
+        },
+        "realitySettings": {
+            "show": False,
+            "dest": dest,
+            "xver": 0,
+            "serverNames": [sni],
+            "privateKey": v_pri,
+            "shortIds": [sid]
+        }
+    }
+})
+
+if m_port > 0:
     inbounds.append({
-        "port": int(port),
-        "protocol": "vless",
+        "port": m_port,
+        "protocol": "vmess",
         "settings": {
             "clients": [
                 {
-                    "id": v_ids[i],
-                    "flow": flow,
-                    "email": f"user{i+1}"
+                    "id": m_id,
+                    "alterId": 0
                 }
-            ],
-            "decryption": "none"
+            ]
         },
         "streamSettings": {
-            "network": "tcp",
-            "security": "reality",
-            "sockopt": {
-                "tcpKeepAliveIdle": 30,
-                "tcpKeepAliveInterval": 10
-            },
-            "realitySettings": {
-                "show": False,
-                "dest": dest,
-                "xver": 0,
-                "serverNames": [sni],
-                "privateKey": v_pris[i],
-                "shortIds": [sid]
-            }
+            "network": "tcp"
         }
     })
 
@@ -237,7 +260,7 @@ if s_port > 0:
         }
     })
 
-data = {
+data={
     "log": {
         "loglevel": "warning"
     },
@@ -249,43 +272,57 @@ data = {
     ]
 }
 
-with open(conf_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
+with open(conf_path,"w",encoding="utf-8") as f:
+    json.dump(data,f,ensure_ascii=False,indent=2)
 PY
 
   ln -sf "$CONF" "$ETC_CONF"
 }
 
 write_show_commands() {
-  cat > /usr/local/bin/show_vless <<'EOF'
+cat > /usr/local/bin/show_vless << 'EOF'
 #!/usr/bin/env bash
 INFO="/etc/node_info"
 [[ -f "$INFO" ]] || { echo "未找到节点信息"; exit 1; }
 source "$INFO"
 
-IP="$(curl -4 -s --connect-timeout 3 --max-time 5 https://api.ipify.org || curl -4 -s --connect-timeout 3 --max-time 5 https://ifconfig.me || hostname -I | awk '{print $1}')"
+IP="$(curl -4 -s https://api.ipify.org || curl -4 -s https://ifconfig.me || hostname -I | awk '{print $1}')"
 
-for i in "${!V_PORTS[@]}"; do
+for i in "${!V_IDS[@]}"; do
   NAME="${V_NAMES[$i]:-vless$((i+1))}"
-  echo "vless://${V_IDS[$i]}@${IP}:${V_PORTS[$i]}?encryption=none&security=reality&sni=${SNI}&fp=${FP}&pbk=${V_PUB_KEYS[$i]}&sid=${SID}&type=tcp&headerType=none&flow=${FLOW}#${NAME}"
+  echo "vless://${V_IDS[$i]}@${IP}:${V_PORT}?encryption=none&security=reality&sni=${SNI}&fp=${FP}&pbk=${V_PUB}&sid=${SID}&type=tcp&headerType=none&flow=${FLOW}#${NAME}"
 done
 EOF
-  chmod +x /usr/local/bin/show_vless
+chmod +x /usr/local/bin/show_vless
 
-  cat > /usr/local/bin/show_s5 <<'EOF'
+cat > /usr/local/bin/show_vmess << 'EOF'
+#!/usr/bin/env bash
+INFO="/etc/node_info"
+[[ -f "$INFO" ]] || { echo "未找到节点信息"; exit 1; }
+source "$INFO"
+
+IP="$(curl -4 -s https://api.ipify.org || curl -4 -s https://ifconfig.me || hostname -I | awk '{print $1}')"
+
+echo "vmess://$(echo -n "{\"v\":\"2\",\"ps\":\"vmess\",\"add\":\"$IP\",\"port\":\"$M_PORT\",\"id\":\"$M_ID\",\"aid\":\"0\",\"net\":\"tcp\",\"type\":\"none\",\"host\":\"\",\"path\":\"\",\"tls\":\"\"}" | base64 -w 0)"
+EOF
+chmod +x /usr/local/bin/show_vmess
+
+cat > /usr/local/bin/show_s5 << 'EOF'
 #!/usr/bin/env bash
 INFO="/etc/node_info"
 [[ -f "$INFO" ]] || { echo "未找到 S5 信息"; exit 1; }
 source "$INFO"
 
-IP="$(curl -4 -s --connect-timeout 3 --max-time 5 https://api.ipify.org || curl -4 -s --connect-timeout 3 --max-time 5 https://ifconfig.me || hostname -I | awk '{print $1}')"
+IP="$(curl -4 -s https://api.ipify.org || curl -4 -s https://ifconfig.me || hostname -I | awk '{print $1}')"
 
 echo "$IP"
 echo "$S_PORT"
 echo "$S_USER"
 echo "$S_PASS"
+echo
+echo "$IP:$S_PORT:$S_USER:$S_PASS"
 EOF
-  chmod +x /usr/local/bin/show_s5
+chmod +x /usr/local/bin/show_s5
 }
 
 apply_all() {
@@ -302,95 +339,88 @@ init_node() {
   write_sysctl
   load_info
   ensure_first_vless
+  ensure_vmess
   ensure_s5
   apply_all
 }
 
-print_links() {
+print_all_links() {
+  echo
+  echo -e "${green}--- VLESS ---${plain}"
+  show_vless
+  echo
+  echo -e "${green}--- VMESS ---${plain}"
+  show_vmess
+  echo
+  echo -e "${green}--- S5 ---${plain}"
+  show_s5
+  echo
+}
+
+print_single_vless() {
+  local idx="$1"
   local ip
   ip="$(get_ip)"
 
   echo
-  echo -e "${green}--- VLESS 链接 ---${plain}"
-  for i in "${!V_PORTS[@]}"; do
-    local name
-    name="${V_NAMES[$i]:-vless$((i+1))}"
-    echo "vless://${V_IDS[$i]}@${ip}:${V_PORTS[$i]}?encryption=none&security=reality&sni=${SNI}&fp=${FP}&pbk=${V_PUB_KEYS[$i]}&sid=${SID}&type=tcp&headerType=none&flow=${FLOW}#${name}"
-  done
-
-  echo
-  echo -e "${green}--- S5 信息 ---${plain}"
-  echo "$ip"
-  echo "$S_PORT"
-  echo "$S_USER"
-  echo "$S_PASS"
-  echo
-  echo "快捷命令：show_vless / show_s5"
+  echo -e "${green}--- VLESS ---${plain}"
+  echo "vless://${V_IDS[$idx]}@${ip}:${V_PORT}?encryption=none&security=reality&sni=${SNI}&fp=${FP}&pbk=${V_PUB}&sid=${SID}&type=tcp&headerType=none&flow=${FLOW}#${V_NAMES[$idx]}"
   echo
 }
 
 add_vless() {
-  local keys pri pub num
-  keys="$(make_keys)"
-  pri="${keys%%|*}"
-  pub="${keys##*|}"
-
-  num=$(( ${#V_PORTS[@]} + 1 ))
-
-  V_PORTS+=("$(rand_port)")
+  local num
+  num=$(( ${#V_IDS[@]} + 1 ))
   V_IDS+=("$(new_uuid)")
-  V_PRI_KEYS+=("$pri")
-  V_PUB_KEYS+=("$pub")
   V_NAMES+=("vless${num}")
-
   apply_all
-  print_links
+  print_single_vless "$((num-1))"
 }
 
 reset_vless() {
   echo
   echo "当前 VLESS："
-  for i in "${!V_PORTS[@]}"; do
-    echo "$((i+1)). ${V_NAMES[$i]:-vless$((i+1))} 端口:${V_PORTS[$i]}"
+  for i in "${!V_IDS[@]}"; do
+    echo "$((i+1)). ${V_NAMES[$i]} 端口:${V_PORT}"
   done
   echo
+
   read -rp "请输入要重置的编号，或输入 all: " opt
 
   if [[ "$opt" == "all" ]]; then
-    for i in "${!V_PORTS[@]}"; do
-      local keys pri pub
-      keys="$(make_keys)"
-      pri="${keys%%|*}"
-      pub="${keys##*|}"
-      V_PORTS[$i]="$(rand_port)"
+    for i in "${!V_IDS[@]}"; do
       V_IDS[$i]="$(new_uuid)"
-      V_PRI_KEYS[$i]="$pri"
-      V_PUB_KEYS[$i]="$pub"
     done
+    apply_all
+    print_all_links
   else
     [[ "$opt" =~ ^[0-9]+$ ]] || { echo "请输入数字或 all"; return; }
     local idx=$((opt-1))
-    [[ "$idx" -ge 0 && "$idx" -lt "${#V_PORTS[@]}" ]] || { echo "编号无效"; return; }
+    [[ "$idx" -ge 0 && "$idx" -lt "${#V_IDS[@]}" ]] || { echo "编号无效"; return; }
 
-    local keys pri pub
-    keys="$(make_keys)"
-    pri="${keys%%|*}"
-    pub="${keys##*|}"
-
-    V_PORTS[$idx]="$(rand_port)"
     V_IDS[$idx]="$(new_uuid)"
-    V_PRI_KEYS[$idx]="$pri"
-    V_PUB_KEYS[$idx]="$pub"
+    apply_all
+    print_single_vless "$idx"
   fi
+}
 
+reset_vmess() {
+  M_PORT="$(rand_port)"
+  M_ID="$(new_uuid)"
   apply_all
-  print_links
+  echo
+  echo -e "${green}--- VMESS ---${plain}"
+  show_vmess
+  echo
 }
 
 reset_s5() {
   S_PORT="$(rand_port)"
   apply_all
-  print_links
+  echo
+  echo -e "${green}--- S5 ---${plain}"
+  show_s5
+  echo
 }
 
 show_status() {
@@ -419,40 +449,43 @@ uninstall_node() {
   [[ "$ok" == "yes" ]] || return
 
   systemctl stop xray >/dev/null 2>&1 || true
-  rm -f "$INFO"
-  rm -f "$CONF"
-  rm -f /usr/local/bin/show_vless /usr/local/bin/show_s5
+  rm -f "$INFO" "$CONF"
+  rm -f /usr/local/bin/show_vless /usr/local/bin/show_vmess /usr/local/bin/show_s5
   echo "已卸载 node 配置"
 }
 
 menu() {
   load_info
-
   clear
+
   echo -e "${green}==========================================${plain}"
-  echo "        node 管理菜单 | IP: $(get_ip)"
+  echo "            node 管理菜单"
+  echo "               $(get_ip)"
   echo -e "${green}==========================================${plain}"
-  echo "1. 查看链接"
+  echo "1. 查看所有链接"
   echo "2. 新增 VLESS"
   echo "3. 重置 VLESS"
-  echo "4. 重置 S5"
-  echo "5. 状态"
-  echo "6. 重启"
-  echo "7. 更新脚本"
-  echo "8. 卸载配置"
+  echo "4. 重置 VMESS"
+  echo "5. 重置 S5"
+  echo "6. 状态"
+  echo "7. 重启"
+  echo "8. 更新脚本"
+  echo "9. 卸载配置"
   echo "0. 退出"
   echo "------------------------------------------"
+
   read -rp "请选择: " opt
 
   case "$opt" in
-    1) print_links; read -rp "按回车返回菜单..." _ ;;
+    1) print_all_links; read -rp "按回车返回菜单..." _ ;;
     2) add_vless; read -rp "按回车返回菜单..." _ ;;
     3) reset_vless; read -rp "按回车返回菜单..." _ ;;
-    4) reset_s5; read -rp "按回车返回菜单..." _ ;;
-    5) show_status; read -rp "按回车返回菜单..." _ ;;
-    6) restart_node; read -rp "按回车返回菜单..." _ ;;
-    7) update_script; read -rp "按回车返回菜单..." _ ;;
-    8) uninstall_node; read -rp "按回车返回菜单..." _ ;;
+    4) reset_vmess; read -rp "按回车返回菜单..." _ ;;
+    5) reset_s5; read -rp "按回车返回菜单..." _ ;;
+    6) show_status; read -rp "按回车返回菜单..." _ ;;
+    7) restart_node; read -rp "按回车返回菜单..." _ ;;
+    8) update_script; read -rp "按回车返回菜单..." _ ;;
+    9) uninstall_node; read -rp "按回车返回菜单..." _ ;;
     0) exit 0 ;;
     *) echo "无效输入"; sleep 1 ;;
   esac
@@ -461,9 +494,9 @@ menu() {
 case "${1:-}" in
   --bootstrap)
     init_node
-    print_links
+    print_all_links
     exit 0
-    ;;
+  ;;
 esac
 
 init_node
