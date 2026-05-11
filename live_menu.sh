@@ -524,7 +524,9 @@ bootstrap() {
   write_config
   create_shortcuts
   restart_xray
-  show_all_links
+  echo
+echo "修复/初始化完成"
+echo
 }
 
 menu_ui() {
