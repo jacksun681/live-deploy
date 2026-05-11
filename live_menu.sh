@@ -602,27 +602,30 @@ EOF
 
   case "$choice" in
     1)
-      show_all_links
+      bootstrap
       ;;
     2)
-      add_vless
+      show_all_links
       ;;
     3)
-      reset_vless
+      add_vless
       ;;
     4)
-      delete_vless
+      reset_vless
       ;;
     5)
-      reset_vmess
+      delete_vless
       ;;
     6)
-      reset_s5
+      reset_vmess
       ;;
     7)
-      update_script
+      reset_s5
       ;;
     8)
+      update_script
+      ;;
+    9)
       uninstall_all
       ;;
     0)
