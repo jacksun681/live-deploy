@@ -568,7 +568,11 @@ EOF
 }
 
 case "${1:-}" in
-  --bootstrap) bootstrap; exit 0 ;;
+  --bootstrap)
+  bootstrap
+  show_all_links
+  exit 0
+  ;;
   internal_show_vless) load_info; show_vless; exit 0 ;;
   internal_show_vmess) load_info; show_vmess; exit 0 ;;
   internal_show_s5) load_info; show_s5; exit 0 ;;
