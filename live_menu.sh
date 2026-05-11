@@ -311,24 +311,24 @@ PY
 
   ln -sf "$CONF" "$ETC_CONF"
 }
+
 restart_xray() {
   systemctl enable xray >/dev/null 2>&1 || true
   systemctl restart xray
 }
 
+# ------------------ 链接生成 ------------------
 build_vless_link() {
   local uuid="$1"
   local name="$2"
   local ip
   ip="$(get_ip)"
-
   echo "vless://${uuid}@${ip}:${V_PORT}?encryption=none&security=reality&sni=${SNI}&fp=${FP}&pbk=${V_PUB}&sid=${SID}&flow=${FLOW}&type=tcp&headerType=none#${name}"
 }
 
 build_vmess_link() {
   local ip
   ip="$(get_ip)"
-
   python3 - <<PY
 import json, base64
 
@@ -364,7 +364,6 @@ show_vmess() {
 show_s5() {
   local ip
   ip="$(get_ip)"
-
   echo "$ip"
   echo "$S_PORT"
   echo "$S_USER"
@@ -388,17 +387,14 @@ show_all_links() {
   echo
 }
 
+# ------------------ 用户操作 ------------------
 add_vless() {
-  local name
-  name="vless$(( ${#V_IDS[@]} + 1 ))"
-
+  local name="vless$(( ${#V_IDS[@]} + 1 ))"
   V_IDS+=("$(new_uuid)")
   V_NAMES+=("$name")
-
   save_info
   write_config
   restart_xray
-
   echo
   echo "已新增: $name"
   build_vless_link "${V_IDS[-1]}" "$name"
@@ -410,33 +406,19 @@ reset_vless() {
     echo "没有 VLESS 用户"
     return
   fi
-
   echo
   for i in "${!V_IDS[@]}"; do
     echo "$((i+1)). ${V_NAMES[$i]}"
   done
   echo
-
   read -rp "请输入编号: " idx
-
-  [[ "$idx" =~ ^[0-9]+$ ]] || {
-    echo "请输入数字"
-    return
-  }
-
+  [[ "$idx" =~ ^[0-9]+$ ]] || { echo "请输入数字"; return; }
   idx=$((idx-1))
-
-  [[ "$idx" -lt 0 || "$idx" -ge "${#V_IDS[@]}" ]] && {
-    echo "编号不存在"
-    return
-  }
-
+  [[ "$idx" -lt 0 || "$idx" -ge "${#V_IDS[@]}" ]] && { echo "编号不存在"; return; }
   V_IDS[$idx]="$(new_uuid)"
-
   save_info
   write_config
   restart_xray
-
   echo
   echo "已重置: ${V_NAMES[$idx]}"
   build_vless_link "${V_IDS[$idx]}" "${V_NAMES[$idx]}"
@@ -448,37 +430,22 @@ delete_vless() {
     echo "至少保留一个 VLESS"
     return
   fi
-
   echo
   for i in "${!V_IDS[@]}"; do
     echo "$((i+1)). ${V_NAMES[$i]}"
   done
   echo
-
   read -rp "请输入编号: " idx
-
-  [[ "$idx" =~ ^[0-9]+$ ]] || {
-    echo "请输入数字"
-    return
-  }
-
+  [[ "$idx" =~ ^[0-9]+$ ]] || { echo "请输入数字"; return; }
   idx=$((idx-1))
-
-  [[ "$idx" -lt 0 || "$idx" -ge "${#V_IDS[@]}" ]] && {
-    echo "编号不存在"
-    return
-  }
-
+  [[ "$idx" -lt 0 || "$idx" -ge "${#V_IDS[@]}" ]] && { echo "编号不存在"; return; }
   unset 'V_IDS[idx]'
   unset 'V_NAMES[idx]'
-
   V_IDS=("${V_IDS[@]}")
   V_NAMES=("${V_NAMES[@]}")
-
   save_info
   write_config
   restart_xray
-
   echo
   echo "已删除"
   echo
@@ -487,11 +454,9 @@ delete_vless() {
 reset_vmess() {
   M_PORT="$(rand_port)"
   M_ID="$(new_uuid)"
-
   save_info
   write_config
   restart_xray
-
   echo
   echo "VMess 已重置"
   show_vmess
@@ -500,11 +465,9 @@ reset_vmess() {
 
 reset_s5() {
   S_PORT="$(rand_port)"
-
   save_info
   write_config
   restart_xray
-
   echo
   echo "S5 已重置"
   show_s5
@@ -515,7 +478,6 @@ update_script() {
   curl -fsSL "$UPDATE_URL" -o "$REAL_PATH"
   sed -i 's/\r$//' "$REAL_PATH"
   chmod +x "$REAL_PATH"
-
   echo
   echo "脚本已更新"
   echo
@@ -523,15 +485,8 @@ update_script() {
 
 uninstall_all() {
   systemctl stop xray >/dev/null 2>&1 || true
-
-  rm -f "$CONF"
-  rm -f "$INFO"
-  rm -f "$REAL_PATH"
-  rm -f "$MENU_PATH"
-  rm -f /usr/local/bin/show_vless
-  rm -f /usr/local/bin/show_vmess
-  rm -f /usr/local/bin/show_s5
-
+  rm -f "$CONF" "$INFO" "$REAL_PATH" "$MENU_PATH"
+  rm -f /usr/local/bin/show_vless /usr/local/bin/show_vmess /usr/local/bin/show_s5
   echo
   echo "已卸载"
   echo
@@ -554,33 +509,26 @@ cat > /usr/local/bin/show_s5 << 'EOF'
 bash /usr/local/bin/live_menu.real internal_show_s5
 EOF
 
-chmod +x /usr/local/bin/show_vless
-chmod +x /usr/local/bin/show_vmess
-chmod +x /usr/local/bin/show_s5
+chmod +x /usr/local/bin/show_vless /usr/local/bin/show_vmess /usr/local/bin/show_s5
 }
 
 bootstrap() {
   install_deps
   install_xray
   write_sysctl
-
   load_info
-
   ensure_first_vless
   ensure_vmess
   ensure_s5
-
   save_info
   write_config
   create_shortcuts
   restart_xray
-
   show_all_links
 }
 
 menu_ui() {
   clear
-
   cat <<EOF
 ==============================
    Xray 综合管理菜单 | IP: $(get_ip)
@@ -599,41 +547,18 @@ menu_ui() {
 EOF
 
   read -rp "请选择: " choice
-
   case "$choice" in
-    1)
-      bootstrap
-      ;;
-    2)
-      show_all_links
-      ;;
-    3)
-      add_vless
-      ;;
-    4)
-      reset_vless
-      ;;
-    5)
-      delete_vless
-      ;;
-    6)
-      reset_vmess
-      ;;
-    7)
-      reset_s5
-      ;;
-    8)
-      update_script
-      ;;
-    9)
-      uninstall_all
-      ;;
-    0)
-      exit 0
-      ;;
-    *)
-      echo "无效选择"
-      ;;
+    1) bootstrap ;;
+    2) show_all_links ;;
+    3) add_vless ;;
+    4) reset_vless ;;
+    5) delete_vless ;;
+    6) reset_vmess ;;
+    7) reset_s5 ;;
+    8) update_script ;;
+    9) uninstall_all ;;
+    0) exit 0 ;;
+    *) echo "无效选择" ;;
   esac
 
   echo
@@ -641,32 +566,11 @@ EOF
 }
 
 case "${1:-}" in
-  --bootstrap)
-    bootstrap
-    exit 0
-    ;;
-
-  internal_show_vless)
-    load_info
-    show_vless
-    exit 0
-    ;;
-
-  internal_show_vmess)
-    load_info
-    show_vmess
-    exit 0
-    ;;
-
-  internal_show_s5)
-    load_info
-    show_s5
-    exit 0
-    ;;
+  --bootstrap) bootstrap; exit 0 ;;
+  internal_show_vless) load_info; show_vless; exit 0 ;;
+  internal_show_vmess) load_info; show_vmess; exit 0 ;;
+  internal_show_s5) load_info; show_s5; exit 0 ;;
 esac
 
 load_info
-
-while true; do
-  menu_ui
-done
+while true; do menu_ui; done
