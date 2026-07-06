@@ -12,6 +12,7 @@ SYSCTL_CONF="/etc/sysctl.d/99-node.conf"
 UPDATE_URL="https://raw.githubusercontent.com/jacksun681/live-deploy/main/node.sh"
 
 V_PORT="443"
+# 默认回落，如果 info 没记录会从下面列表随机挑
 SNI="www.microsoft.com"
 DEST="www.microsoft.com:443"
 FP="chrome"
@@ -79,6 +80,22 @@ new_sid() {
   openssl rand -hex 8
 }
 
+# 随机获取一个常见的国外大厂 SNI 域名
+get_random_sni() {
+  local domains=(
+    "www.microsoft.com"
+    "azure.microsoft.com"
+    "images.apple.com"
+    "www.cloudflare.com"
+    "www.icloud.com"
+    "www.speedtest.net"
+    "www.lovelive-anime.jp"
+  )
+  local size=${#domains[@]}
+  local index=$((RANDOM % size))
+  echo "${domains[$index]}"
+}
+
 write_sysctl() {
   cat > "$SYSCTL_CONF" <<EOF
 net.core.default_qdisc=fq
@@ -113,6 +130,11 @@ EOF
 load_info() {
   if [[ -f "$INFO" ]]; then
     source "$INFO"
+    # 如果读取出的 SNI 为空，做一次兜底补全
+    if [[ -z "${SNI:-}" ]]; then
+      SNI="$(get_random_sni)"
+      DEST="${SNI}:443"
+    fi
   else
     V_IDS=()
     V_NAMES=()
@@ -123,6 +145,9 @@ load_info() {
     KEYS="$(make_keys)"
     V_PRI="${KEYS%%|*}"
     V_PUB="${KEYS##*|}"
+    # 新节点初始化时，随机挑一个域名
+    SNI="$(get_random_sni)"
+    DEST="${SNI}:443"
   fi
 }
 
@@ -240,7 +265,12 @@ if m_port > 0:
             ]
         },
         "streamSettings": {
-            "network": "tcp"
+            "network": "tcp",
+            "tcpSettings": {
+                "header": {
+                    "type": "http"
+                }
+            }
         }
     })
 
@@ -304,7 +334,7 @@ source "$INFO"
 
 IP="$(curl -4 -s https://api.ipify.org || curl -4 -s https://ifconfig.me || hostname -I | awk '{print $1}')"
 
-echo "vmess://$(echo -n "{\"v\":\"2\",\"ps\":\"vmess\",\"add\":\"$IP\",\"port\":\"$M_PORT\",\"id\":\"$M_ID\",\"aid\":\"0\",\"net\":\"tcp\",\"type\":\"none\",\"host\":\"\",\"path\":\"\",\"tls\":\"\"}" | base64 -w 0)"
+echo "vmess://$(echo -n "{\"v\":\"2\",\"ps\":\"vmess-http\",\"add\":\"$IP\",\"port\":\"$M_PORT\",\"id\":\"$M_ID\",\"aid\":\"0\",\"net\":\"tcp\",\"type\":\"http\",\"host\":\"\",\"path\":\"\",\"tls\":\"\"}" | base64 -w 0)"
 EOF
 chmod +x /usr/local/bin/show_vmess
 
@@ -324,6 +354,17 @@ echo
 echo "$IP:$S_PORT:$S_USER:$S_PASS"
 EOF
 chmod +x /usr/local/bin/show_s5
+}
+
+# 辅助输出函数，提供给脚本内直接调用展示
+show_vless() {
+  /usr/local/bin/show_vless
+}
+show_vmess() {
+  /usr/local/bin/show_vmess
+}
+show_s5() {
+  /usr/local/bin/show_s5
 }
 
 apply_all() {
@@ -347,10 +388,10 @@ init_node() {
 
 print_all_links() {
   echo
-  echo -e "${green}--- VLESS ---${plain}"
+  echo -e "${green}--- VLESS (SNI: ${SNI}) ---${plain}"
   show_vless
   echo
-  echo -e "${green}--- VMESS ---${plain}"
+  echo -e "${green}--- VMESS (HTTP 伪装) ---${plain}"
   show_vmess
   echo
   echo -e "${green}--- S5 ---${plain}"
@@ -364,7 +405,7 @@ print_single_vless() {
   ip="$(get_ip)"
 
   echo
-  echo -e "${green}--- VLESS ---${plain}"
+  echo -e "${green}--- VLESS (SNI: ${SNI}) ---${plain}"
   echo "vless://${V_IDS[$idx]}@${ip}:${V_PORT}?encryption=none&security=reality&sni=${SNI}&fp=${FP}&pbk=${V_PUB}&sid=${SID}&type=tcp&headerType=none&flow=${FLOW}#${V_NAMES[$idx]}"
   echo
 }
@@ -387,6 +428,10 @@ reset_vless() {
   echo
 
   read -rp "请输入要重置的编号，或输入 all: " opt
+
+  # 重置 VLESS 时顺便将域名随机刷新一次
+  SNI="$(get_random_sni)"
+  DEST="${SNI}:443"
 
   if [[ "$opt" == "all" ]]; then
     for i in "${!V_IDS[@]}"; do
