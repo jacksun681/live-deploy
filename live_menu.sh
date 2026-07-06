@@ -13,6 +13,7 @@ SYSCTL_CONF="/etc/sysctl.d/99-live.conf"
 UPDATE_URL="https://raw.githubusercontent.com/jacksun681/live-deploy/main/live_menu.sh"
 
 V_PORT="443"
+# 默认回落，如果 info 没记录会从下面列表随机挑
 SNI="www.microsoft.com"
 DEST="www.microsoft.com:443"
 FP="chrome"
@@ -86,6 +87,22 @@ new_sid() {
   openssl rand -hex 8
 }
 
+# 随机获取一个常见的 SNI 域名
+get_random_sni() {
+  local domains=(
+    "www.microsoft.com"
+    "azure.microsoft.com"
+    "www.lovelive-anime.jp"
+    "www.speedtest.net"
+    "images.apple.com"
+    "www.cloudflare.com"
+    "www.icloud.com"
+  )
+  local size=${#domains[@]}
+  local index=$((RANDOM % size))
+  echo "${domains[$index]}"
+}
+
 write_sysctl() {
   cat > "$SYSCTL_CONF" <<EOF
 net.core.default_qdisc=fq
@@ -130,8 +147,8 @@ load_info() {
   S_USER="$S_USER"
   S_PASS="$S_PASS"
   SID=""
-  SNI="$SNI"
-  DEST="$DEST"
+  SNI=""
+  DEST=""
   FP="$FP"
   FLOW="$FLOW"
 
@@ -141,8 +158,13 @@ load_info() {
   fi
 
   [[ -z "${V_PORT:-}" ]] && V_PORT="443"
-  [[ -z "${SNI:-}" ]] && SNI="www.microsoft.com"
-  [[ -z "${DEST:-}" ]] && DEST="www.microsoft.com:443"
+  
+  # 如果 SNI 为空，则随机挑一个
+  if [[ -z "${SNI:-}" ]]; then
+    SNI="$(get_random_sni)"
+    DEST="${SNI}:443"
+  fi
+
   [[ -z "${FP:-}" ]] && FP="chrome"
   [[ -z "${FLOW:-}" ]] && FLOW="xtls-rprx-vision"
   [[ -z "${S_USER:-}" ]] && S_USER="zxwl123"
@@ -272,7 +294,12 @@ if m_port > 0:
             ]
         },
         "streamSettings": {
-            "network": "tcp"
+            "network": "tcp",
+            "tcpSettings": {
+                "header": {
+                    "type": "http"
+                }
+            }
         }
     })
 
@@ -334,14 +361,14 @@ import json, base64
 
 obj = {
     "v": "2",
-    "ps": "vmess",
+    "ps": "vmess-http",
     "add": "$ip",
     "port": "$M_PORT",
     "id": "$M_ID",
     "aid": "0",
     "scy": "auto",
     "net": "tcp",
-    "type": "none",
+    "type": "http",
     "host": "",
     "path": "",
     "tls": ""
@@ -374,11 +401,11 @@ show_s5() {
 
 show_all_links() {
   echo
-  echo -e "${green}========== VLESS ==========${plain}"
+  echo -e "${green}========== VLESS (SNI: ${SNI}) ==========${plain}"
   show_vless
 
   echo
-  echo -e "${green}========== VMESS ==========${plain}"
+  echo -e "${green}========== VMESS (HTTP 伪装) ==========${plain}"
   show_vmess
 
   echo
@@ -415,12 +442,17 @@ reset_vless() {
   [[ "$idx" =~ ^[0-9]+$ ]] || { echo "请输入数字"; return; }
   idx=$((idx-1))
   [[ "$idx" -lt 0 || "$idx" -ge "${#V_IDS[@]}" ]] && { echo "编号不存在"; return; }
+  
+  # 重置 VLESS 时顺便将域名随机刷新一次
+  SNI="$(get_random_sni)"
+  DEST="${SNI}:443"
+  
   V_IDS[$idx]="$(new_uuid)"
   save_info
   write_config
   restart_xray
   echo
-  echo "已重置: ${V_NAMES[$idx]}"
+  echo "已重置: ${V_NAMES[$idx]} (新SNI: $SNI)"
   build_vless_link "${V_IDS[$idx]}" "${V_NAMES[$idx]}"
   echo
 }
@@ -516,6 +548,11 @@ bootstrap() {
   install_deps
   install_xray
   write_sysctl
+  
+  # 强制初始化时重新随机生成一个 SNI
+  SNI="$(get_random_sni)"
+  DEST="${SNI}:443"
+  
   load_info
   ensure_first_vless
   ensure_vmess
@@ -535,10 +572,10 @@ menu_ui() {
 ==============================
    Xray 综合管理菜单 | IP: $(get_ip)
 ==============================
-1. 修复/初始化
+1. 修复/初始化 (会重新随机 VLESS 域名)
 2. 查看全部链接
 3. 新增 VLESS
-4. 重置 VLESS
+4. 重置 VLESS (会重新随机 VLESS 域名)
 5. 删除 VLESS
 6. 重置 VMess
 7. 重置 S5
