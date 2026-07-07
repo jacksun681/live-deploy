@@ -12,9 +12,9 @@ SYSCTL_CONF="/etc/sysctl.d/99-node.conf"
 UPDATE_URL="https://raw.githubusercontent.com/jacksun681/live-deploy/main/node.sh"
 
 V_PORT="443"
-# 默认回落，如果 info 没记录会从下面列表随机挑
-SNI="www.microsoft.com"
-DEST="www.microsoft.com:443"
+# 默认回落修改为苹果官网
+SNI="images.apple.com"
+DEST="images.apple.com:443"
 FP="chrome"
 FLOW="xtls-rprx-vision"
 
@@ -80,16 +80,16 @@ new_sid() {
   openssl rand -hex 8
 }
 
-# 随机获取一个常见的国外大厂 SNI 域名
+# 已彻底剔除微软域名，全换成其他国外安全大厂官方域名
 get_random_sni() {
   local domains=(
-    "www.microsoft.com"
-    "azure.microsoft.com"
     "images.apple.com"
     "www.cloudflare.com"
     "www.icloud.com"
     "www.speedtest.net"
     "www.lovelive-anime.jp"
+    "www.amazon.com"
+    "dl.google.com"
   )
   local size=${#domains[@]}
   local index=$((RANDOM % size))
@@ -130,8 +130,8 @@ EOF
 load_info() {
   if [[ -f "$INFO" ]]; then
     source "$INFO"
-    # 如果读取出的 SNI 为空，做一次兜底补全
-    if [[ -z "${SNI:-}" ]]; then
+    # 如果已存的旧配置刚好是微软域名，则强制刷新掉
+    if [[ -z "${SNI:-}" || "$SNI" == *microsoft* ]]; then
       SNI="$(get_random_sni)"
       DEST="${SNI}:443"
     fi
@@ -145,7 +145,6 @@ load_info() {
     KEYS="$(make_keys)"
     V_PRI="${KEYS%%|*}"
     V_PUB="${KEYS##*|}"
-    # 新节点初始化时，随机挑一个域名
     SNI="$(get_random_sni)"
     DEST="${SNI}:443"
   fi
@@ -356,7 +355,6 @@ EOF
 chmod +x /usr/local/bin/show_s5
 }
 
-# 辅助输出函数，提供给脚本内直接调用展示
 show_vless() {
   /usr/local/bin/show_vless
 }
@@ -429,7 +427,7 @@ reset_vless() {
 
   read -rp "请输入要重置的编号，或输入 all: " opt
 
-  # 重置 VLESS 时顺便将域名随机刷新一次
+  # 每次重置时都重新抽取一个非微软的随机域名
   SNI="$(get_random_sni)"
   DEST="${SNI}:443"
 
@@ -509,7 +507,7 @@ echo "        node 管理菜单 | IP: $(get_ip)"
 echo -e "${green}==========================================${plain}"
   echo "1. 查看所有链接"
   echo "2. 新增 VLESS"
-  echo "3. 重置 VLESS"
+  echo "3. 重置 VLESS (会强制更换为非微软域名)"
   echo "4. 重置 VMESS"
   echo "5. 重置 S5"
   echo "6. 状态"
