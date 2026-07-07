@@ -13,9 +13,9 @@ SYSCTL_CONF="/etc/sysctl.d/99-live.conf"
 UPDATE_URL="https://raw.githubusercontent.com/jacksun681/live-deploy/main/live_menu.sh"
 
 V_PORT="443"
-# 默认回落，如果 info 没记录会从下面列表随机挑
-SNI="www.microsoft.com"
-DEST="www.microsoft.com:443"
+# 默认回落修改为苹果官网
+SNI="images.apple.com"
+DEST="images.apple.com:443"
 FP="chrome"
 FLOW="xtls-rprx-vision"
 
@@ -87,16 +87,16 @@ new_sid() {
   openssl rand -hex 8
 }
 
-# 随机获取一个常见的 SNI 域名
+# 已彻底剔除微软域名，全换成其他国外安全大厂官方域名
 get_random_sni() {
   local domains=(
-    "www.microsoft.com"
-    "azure.microsoft.com"
-    "www.lovelive-anime.jp"
-    "www.speedtest.net"
     "images.apple.com"
     "www.cloudflare.com"
     "www.icloud.com"
+    "www.speedtest.net"
+    "www.lovelive-anime.jp"
+    "www.amazon.com"
+    "dl.google.com"
   )
   local size=${#domains[@]}
   local index=$((RANDOM % size))
@@ -159,8 +159,8 @@ load_info() {
 
   [[ -z "${V_PORT:-}" ]] && V_PORT="443"
   
-  # 如果 SNI 为空，则随机挑一个
-  if [[ -z "${SNI:-}" ]]; then
+  # 如果没有域名，或者旧域名是微软的，则强制刷新为非微软随机域名
+  if [[ -z "${SNI:-}" || "$SNI" == *microsoft* ]]; then
     SNI="$(get_random_sni)"
     DEST="${SNI}:443"
   fi
@@ -443,10 +443,10 @@ reset_vless() {
   idx=$((idx-1))
   [[ "$idx" -lt 0 || "$idx" -ge "${#V_IDS[@]}" ]] && { echo "编号不存在"; return; }
   
-  # 重置 VLESS 时顺便将域名随机刷新一次
+  # 重置时重新抽取非微软的随机域名
   SNI="$(get_random_sni)"
   DEST="${SNI}:443"
-  
+
   V_IDS[$idx]="$(new_uuid)"
   save_info
   write_config
@@ -549,10 +549,10 @@ bootstrap() {
   install_xray
   write_sysctl
   
-  # 强制初始化时重新随机生成一个 SNI
+  # 初始化强制刷新为非微软随机域名
   SNI="$(get_random_sni)"
   DEST="${SNI}:443"
-  
+
   load_info
   ensure_first_vless
   ensure_vmess
@@ -572,10 +572,10 @@ menu_ui() {
 ==============================
    Xray 综合管理菜单 | IP: $(get_ip)
 ==============================
-1. 修复/初始化 (会重新随机 VLESS 域名)
+1. 修复/初始化 
 2. 查看全部链接
 3. 新增 VLESS
-4. 重置 VLESS (会重新随机 VLESS 域名)
+4. 重置 VLESS 
 5. 删除 VLESS
 6. 重置 VMess
 7. 重置 S5
